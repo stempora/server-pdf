@@ -65,6 +65,7 @@ if (( current_node_major < 22 )); then
   fi
 fi
 [[ "$(node --version | sed -E 's/^v([0-9]+).*/\1/')" = "22" ]] || die "Node.js 22 installation verification failed."
+node -e 'const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(":memory:"); db.close();'
 
 if ! command -v google-chrome-stable >/dev/null 2>&1; then
   if [[ "${PACKAGE_FAMILY}" = "deb" ]]; then
@@ -84,16 +85,19 @@ fi
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --create-home --home-dir /home/pdf --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
-install -d -o pdf -g pdf -m 0750 "${INSTALL_DIR}" "${INSTALL_DIR}/logs" "${INSTALL_DIR}/postman"
+install -d -o pdf -g pdf -m 0750 "${INSTALL_DIR}" "${INSTALL_DIR}/logs" "${INSTALL_DIR}/postman" "${INSTALL_DIR}/data"
 
 # Validate the release before touching the running application.
 STAGING_DIR="$(mktemp -d /tmp/html2pdf-install.XXXXXX)"
 install -m 0644 "${SCRIPT_DIR}/server.js" "${STAGING_DIR}/server.js"
 install -m 0644 "${SCRIPT_DIR}/key-store.js" "${STAGING_DIR}/key-store.js"
+install -m 0644 "${SCRIPT_DIR}/metrics-store.js" "${STAGING_DIR}/metrics-store.js"
 install -m 0644 "${SCRIPT_DIR}/package.json" "${STAGING_DIR}/package.json"
 install -m 0644 "${SCRIPT_DIR}/package-lock.json" "${STAGING_DIR}/package-lock.json"
 node --check "${STAGING_DIR}/server.js"
 node --check "${STAGING_DIR}/key-store.js"
+node --check "${STAGING_DIR}/metrics-store.js"
+node --check "${SCRIPT_DIR}/scripts/init-metrics-db.js"
 
 if [[ ! -e "${INSTALL_DIR}/master-key.json" ]]; then
   master_key="$(openssl rand -hex 32)"
@@ -128,6 +132,11 @@ API_KEYS_FILE=/home/pdf/server/apikeys.json
 MASTER_KEY_FILE=/home/pdf/server/master-key.json
 API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
 LOG_DIR=/home/pdf/server/logs
+METRICS_DB_FILE=/home/pdf/server/data/metrics.sqlite
+METRICS_ENABLED=true
+METRICS_FLUSH_INTERVAL_MS=2000
+METRICS_FLUSH_MAX_EVENTS=100
+METRICS_MAX_PENDING_EVENTS=10000
 PDF_REQUEST_TIMEOUT_MS=60000
 PDF_TIMEOUT_CLEANUP_MS=3000
 BROWSER_MAX_REQUESTS=5000
@@ -158,6 +167,7 @@ node -e '
 # Only application artifacts are replaced; production state remains in place.
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/server.js" "${INSTALL_DIR}/server.js"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/key-store.js" "${INSTALL_DIR}/key-store.js"
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/metrics-store.js" "${INSTALL_DIR}/metrics-store.js"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package.json" "${INSTALL_DIR}/package.json"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package-lock.json" "${INSTALL_DIR}/package-lock.json"
 runuser -u pdf -- npm --prefix "${INSTALL_DIR}" ci --omit=dev --ignore-scripts
@@ -167,6 +177,9 @@ chmod 0600 "${INSTALL_DIR}/master-key.json" "${INSTALL_DIR}/apikeys.json" "${INS
 chmod 0640 "${INSTALL_DIR}/environment"
 node --check "${INSTALL_DIR}/server.js"
 node --check "${INSTALL_DIR}/key-store.js"
+node --check "${INSTALL_DIR}/metrics-store.js"
+runuser -u pdf -- node "${INSTALL_DIR}/scripts/init-metrics-db.js"
+chmod 0600 "${INSTALL_DIR}/data/metrics.sqlite"
 
 if [[ -d "${SCRIPT_DIR}/postman" ]]; then
   find "${SCRIPT_DIR}/postman" -maxdepth 1 -type f -name '*.json' -exec \

@@ -45,6 +45,11 @@ API_KEYS_FILE=/home/pdf/server/apikeys.json
 MASTER_KEY_FILE=/home/pdf/server/master-key.json
 API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
 LOG_DIR=/home/pdf/server/logs
+METRICS_DB_FILE=/home/pdf/server/data/metrics.sqlite
+METRICS_ENABLED=true
+METRICS_FLUSH_INTERVAL_MS=2000
+METRICS_FLUSH_MAX_EVENTS=100
+METRICS_MAX_PENDING_EVENTS=10000
 PDF_REQUEST_TIMEOUT_MS=60000
 PDF_TIMEOUT_CLEANUP_MS=3000
 BROWSER_MAX_REQUESTS=5000
@@ -180,7 +185,7 @@ git pull --ff-only
 sudo ./update.sh
 ```
 
-Fișierele `environment`, `master-key.json`, `apikeys.json`, `api-key-metadata.json` și `logs/` nu sunt înlocuite de updater.
+Fișierele `environment`, `master-key.json`, `apikeys.json`, `api-key-metadata.json`, `data/metrics.sqlite` și `logs/` nu sunt înlocuite de updater.
 
 ## Watchdog systemd
 
@@ -207,6 +212,45 @@ Rollback-ul codului prin `update.sh` nu modifică unitățile instalate. Pentru 
 sudo systemctl disable --now html2pdf-watchdog.timer
 ```
 
+## Statistici SQLite per API key
+
+Statisticile sunt păstrate implicit în `/home/pdf/server/data/metrics.sqlite`, cu owner `pdf:pdf` și mod `0600`. Directorul și baza sunt create automat la startup și explicit prin:
+
+```bash
+node scripts/init-metrics-db.js
+node scripts/init-metrics-db.js --check
+node scripts/init-metrics-db.js --status
+```
+
+Schema folosește `PRAGMA user_version`, iar migrările sunt idempotente. SQLite rulează în WAL, cu `synchronous=NORMAL`, `busy_timeout=5000` și foreign keys active. `update.sh` migrează înainte de restart și creează un backup consistent înaintea unei migrări existente; rollback-ul codului nu șterge baza.
+
+SQLite conține numai fingerprintul SHA-256, nu cheia API completă. Evenimentele sunt agregate în memorie și scrise tranzacțional la 2 secunde sau 100 de evenimente. Retry-ul Chrome aparține aceleiași conversii și nu dublează contoarele.
+
+- `request_count`: request `/pdf` cu o cheie validă;
+- `started_count`: conversie preluată din coadă;
+- `success_count`, `error_count`, `timeout_count`: rezultatul final;
+- `queue_rejected_count`: coadă plină;
+- `client_aborted_count`: client deconectat înainte de răspuns;
+- `validation_error_count`: URL lipsă sau invalid după autentificare.
+
+Durata nu include timpul din coadă, iar statisticile zilnice folosesc UTC. La ștergerea unei chei, statisticile și ultimul nume rămân, dar cheia completă nu este păstrată.
+
+```text
+GET /admin/list-keys
+GET /admin/metrics?limit=100&offset=0
+GET /admin/metrics/daily?from=YYYY-MM-DD&to=YYYY-MM-DD&fingerprint=SHA256
+```
+
+Intervalul zilnic este limitat la 366 zile. Metrics este fail-open: SQLite blocat, indisponibil sau corupt nu oprește PDF-ul și nu schimbă starea principală din `/health`; diagnosticul separat este în `health.metrics`. Coada în memorie este limitată, iar pierderile controlate apar în `droppedEvents`.
+
+```bash
+sudo -u pdf node scripts/init-metrics-db.js --status
+sudo -u pdf node scripts/init-metrics-db.js --check
+journalctl -u html2pdf.service | grep METRICS
+```
+
+Pentru backup manual consistent folosiți API-ul SQLite backup sau `VACUUM INTO`; nu copiați brutal baza activă separat de WAL.
+
 ## Postman
 
 Importați:
@@ -221,6 +265,8 @@ Selectați environmentul `server-pdf local` și completați local `master_key`. 
 ```bash
 node --check server.js
 node --check key-store.js
+node --check metrics-store.js
+node --check scripts/init-metrics-db.js
 npm test
 ```
 

@@ -9,6 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "dependencies": {
     "express": "^5.1.0",
     "p-limit": "^2.3.0",

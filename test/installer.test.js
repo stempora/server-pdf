@@ -46,6 +46,11 @@ test('installer adds stability defaults only to a newly created environment and 
   for (const setting of [
     'PDF_REQUEST_TIMEOUT_MS=60000',
     'PDF_TIMEOUT_CLEANUP_MS=3000',
+    'METRICS_DB_FILE=/home/pdf/server/data/metrics.sqlite',
+    'METRICS_ENABLED=true',
+    'METRICS_FLUSH_INTERVAL_MS=2000',
+    'METRICS_FLUSH_MAX_EVENTS=100',
+    'METRICS_MAX_PENDING_EVENTS=10000',
     'BROWSER_MAX_REQUESTS=5000',
     'BROWSER_MAX_UPTIME_SECONDS=21600',
     'WATCHDOG_FAILURE_THRESHOLD=2',
@@ -54,6 +59,19 @@ test('installer adds stability defaults only to a newly created environment and 
   assert.ok(installer.indexOf('scripts/install-watchdog.sh') > installer.indexOf('curl --silent --fail http://127.0.0.1:8214/health'));
   assert.doesNotMatch(updater, /install-watchdog|html2pdf-watchdog/);
   assert.doesNotMatch(watchdogInstaller, /(?:restart|start) html2pdf\.service/);
+});
+
+test('installer and updater initialize persistent metrics safely', () => {
+  assert.match(installer, /"\$\{INSTALL_DIR\}\/data"/);
+  assert.match(installer, /install -d -o pdf -g pdf -m 0750/);
+  assert.match(installer, /runuser -u pdf -- node "\$\{INSTALL_DIR\}\/scripts\/init-metrics-db\.js"/);
+  assert.match(installer, /chmod 0600 "\$\{INSTALL_DIR\}\/data\/metrics\.sqlite"/);
+  assert.match(updater, /node --check scripts\/init-metrics-db\.js/);
+  assert.match(updater, /runuser -u pdf -- node scripts\/init-metrics-db\.js --backup "\$\{BACKUP_DIR\}\/metrics\.sqlite"/);
+  assert.ok(updater.indexOf('init-metrics-db.js --backup') < updater.lastIndexOf('systemctl restart "${SERVICE}"'));
+  for (const rule of ['data/*.sqlite', 'data/*.sqlite-wal', 'data/*.sqlite-shm', 'data/*.db']) {
+    assert.ok(ignore.split(/\r?\n/).includes(rule), `Missing ${rule}`);
+  }
 });
 
 test('systemd unit retains all existing production tuning', () => {
