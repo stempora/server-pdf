@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=@SERVICE_USER@
-Group=@SERVICE_USER@
-WorkingDirectory=@INSTALL_DIR@
-ExecStart=/usr/bin/node @INSTALL_DIR@/server.js
-EnvironmentFile=@CONFIG_DIR@/environment
+User=pdf
+Group=pdf
+WorkingDirectory=/home/pdf/server
+ExecStart=/usr/bin/node /home/pdf/server/server.js
+EnvironmentFile=/home/pdf/server/environment
 
 Restart=always
 RestartSec=5

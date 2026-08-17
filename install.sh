@@ -1,32 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-html2pdf}"
-SERVICE_USER="${SERVICE_USER:-pdf}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/html2pdf}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/html2pdf}"
-PORT="${PORT:-8214}"
-NODE_MAJOR="${NODE_MAJOR:-22}"
-CHROME_BIN="${CHROME_PATH:-}"
+SERVICE_USER="pdf"
+INSTALL_DIR="/home/pdf/server"
+SERVICE_FILE="/etc/systemd/system/html2pdf.service"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-GENERATED_API_KEY=""
+STAGING_DIR=""
+GENERATED_MASTER_KEY=""
 
 log() { printf '[html2pdf] %s\n' "$*"; }
 die() { printf '[html2pdf] ERROR: %s\n' "$*" >&2; exit 1; }
+cleanup() { [[ -z "${STAGING_DIR}" ]] || rm -rf -- "${STAGING_DIR}"; }
+trap cleanup EXIT
 
-if [[ "${EUID}" -ne 0 ]]; then
-  die "Run this installer as root (for example: sudo ./install.sh)."
-fi
-
+[[ "${EUID}" -eq 0 ]] || die "Run this installer as root (sudo ./install.sh)."
 [[ -f /etc/debian_version ]] || die "Only Debian and Ubuntu are supported."
-[[ "${INSTALL_DIR}" = /* && "${CONFIG_DIR}" = /* ]] || die "INSTALL_DIR and CONFIG_DIR must be absolute paths."
-[[ "${PORT}" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be between 1 and 65535."
-[[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid SERVICE_USER."
-[[ "${SERVICE_NAME}" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "Invalid SERVICE_NAME."
+[[ ! -e "${INSTALL_DIR}/server.js" ]] || die "An existing installation was found; use update.sh instead."
 
 export DEBIAN_FRONTEND=noninteractive
-
-log "Installing operating-system prerequisites"
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl gnupg openssl
 
@@ -34,88 +25,118 @@ current_node_major=0
 if command -v node >/dev/null 2>&1; then
   current_node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
 fi
-
 if (( current_node_major < 18 )); then
-  log "Installing Node.js ${NODE_MAJOR}.x from NodeSource"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/html2pdf-nodesource.sh
+  curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/html2pdf-nodesource.sh
   bash /tmp/html2pdf-nodesource.sh
   rm -f /tmp/html2pdf-nodesource.sh
   apt-get install -y --no-install-recommends nodejs
 fi
 
-if [[ -z "${CHROME_BIN}" ]] && command -v google-chrome-stable >/dev/null 2>&1; then
-  CHROME_BIN="$(command -v google-chrome-stable)"
-fi
-
-if [[ -z "${CHROME_BIN}" ]]; then
-  [[ "$(dpkg --print-architecture)" = "amd64" ]] || die "Google Chrome is only installed automatically on amd64. Set CHROME_PATH after installing a compatible Chromium browser."
-  log "Installing Google Chrome stable"
+if ! command -v google-chrome-stable >/dev/null 2>&1; then
+  [[ "$(dpkg --print-architecture)" = "amd64" ]] || die "Automatic Google Chrome installation requires amd64."
   curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/html2pdf-chrome.deb
   apt-get install -y /tmp/html2pdf-chrome.deb
   rm -f /tmp/html2pdf-chrome.deb
-  CHROME_BIN="$(command -v google-chrome-stable)"
-fi
-[[ -x "${CHROME_BIN}" ]] || die "CHROME_PATH is not an executable file: ${CHROME_BIN}"
-
-id "${SERVICE_USER}" >/dev/null 2>&1 || useradd --system --home-dir "${INSTALL_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
-install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${INSTALL_DIR}" "${INSTALL_DIR}/logs"
-install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
-
-log "Installing application files"
-install -o root -g root -m 0644 "${SCRIPT_DIR}/server.js" "${INSTALL_DIR}/server.js"
-install -o root -g root -m 0644 "${SCRIPT_DIR}/package.json" "${INSTALL_DIR}/package.json"
-if [[ -f "${SCRIPT_DIR}/package-lock.json" ]]; then
-  install -o root -g root -m 0644 "${SCRIPT_DIR}/package-lock.json" "${INSTALL_DIR}/package-lock.json"
-  npm --prefix "${INSTALL_DIR}" ci --omit=dev --ignore-scripts
-else
-  npm --prefix "${INSTALL_DIR}" install --omit=dev --ignore-scripts
 fi
 
-if [[ ! -s "${CONFIG_DIR}/apikeys.json" ]]; then
-  GENERATED_API_KEY="${API_KEY:-$(openssl rand -hex 32)}"
-  [[ "${GENERATED_API_KEY}" =~ ^[A-Za-z0-9._~-]+$ ]] || die "API_KEY may contain only URL-safe characters."
-  printf '["%s"]\n' "${GENERATED_API_KEY}" > "${CONFIG_DIR}/apikeys.json"
+if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+  useradd --create-home --home-dir /home/pdf --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
-chown root:"${SERVICE_USER}" "${CONFIG_DIR}/apikeys.json"
-chmod 0640 "${CONFIG_DIR}/apikeys.json"
+install -d -o pdf -g pdf -m 0750 "${INSTALL_DIR}" "${INSTALL_DIR}/logs" "${INSTALL_DIR}/postman"
 
-cat > "${CONFIG_DIR}/environment" <<EOF
-PORT=${PORT}
-CHROME_PATH=${CHROME_BIN}
-API_KEYS_FILE=${CONFIG_DIR}/apikeys.json
-LOG_DIR=${INSTALL_DIR}/logs
-MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-20}
-MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-200}
-NAVIGATION_TIMEOUT_MS=${NAVIGATION_TIMEOUT_MS:-30000}
-PAGE_TIMEOUT_MS=${PAGE_TIMEOUT_MS:-15000}
-FONT_TIMEOUT_MS=${FONT_TIMEOUT_MS:-5000}
-RENDER_DELAY_MS=${RENDER_DELAY_MS:-250}
-SHUTDOWN_TIMEOUT_MS=${SHUTDOWN_TIMEOUT_MS:-15000}
+# Validate the release before touching the running application.
+STAGING_DIR="$(mktemp -d /tmp/html2pdf-install.XXXXXX)"
+install -m 0644 "${SCRIPT_DIR}/server.js" "${STAGING_DIR}/server.js"
+install -m 0644 "${SCRIPT_DIR}/key-store.js" "${STAGING_DIR}/key-store.js"
+install -m 0644 "${SCRIPT_DIR}/package.json" "${STAGING_DIR}/package.json"
+install -m 0644 "${SCRIPT_DIR}/package-lock.json" "${STAGING_DIR}/package-lock.json"
+node --check "${STAGING_DIR}/server.js"
+node --check "${STAGING_DIR}/key-store.js"
+
+if [[ ! -e "${INSTALL_DIR}/master-key.json" ]]; then
+  master_key="$(openssl rand -hex 32)"
+  GENERATED_MASTER_KEY="${master_key}"
+  created_at="$(node -e 'process.stdout.write(new Date().toISOString())')"
+  temporary_json="$(mktemp "${INSTALL_DIR}/.master-key.json.XXXXXX")"
+  printf '{\n  "key": "%s",\n  "created_at": "%s"\n}\n' \
+    "${master_key}" "${created_at}" > "${temporary_json}"
+  chmod 0600 "${temporary_json}"
+  mv -- "${temporary_json}" "${INSTALL_DIR}/master-key.json"
+fi
+if [[ ! -e "${INSTALL_DIR}/apikeys.json" ]]; then
+  api_key="${API_KEY:-$(openssl rand -hex 32)}"
+  encoded_api_key="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "${api_key}")"
+  temporary_json="$(mktemp "${INSTALL_DIR}/.apikeys.json.XXXXXX")"
+  printf '[%s]\n' "${encoded_api_key}" > "${temporary_json}"
+  chmod 0600 "${temporary_json}"
+  mv -- "${temporary_json}" "${INSTALL_DIR}/apikeys.json"
+  log "Generated initial API key: ${api_key}"
+fi
+if [[ ! -e "${INSTALL_DIR}/api-key-metadata.json" ]]; then
+  temporary_json="$(mktemp "${INSTALL_DIR}/.api-key-metadata.json.XXXXXX")"
+  printf '{}\n' > "${temporary_json}"
+  chmod 0600 "${temporary_json}"
+  mv -- "${temporary_json}" "${INSTALL_DIR}/api-key-metadata.json"
+fi
+if [[ ! -e "${INSTALL_DIR}/environment" ]]; then
+  cat > "${INSTALL_DIR}/environment" <<'EOF'
+PORT=8214
+CHROME_PATH=/usr/bin/google-chrome-stable
+API_KEYS_FILE=/home/pdf/server/apikeys.json
+MASTER_KEY_FILE=/home/pdf/server/master-key.json
+API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
+LOG_DIR=/home/pdf/server/logs
 EOF
-chown root:"${SERVICE_USER}" "${CONFIG_DIR}/environment"
-chmod 0640 "${CONFIG_DIR}/environment"
+fi
 
-sed \
-  -e "s|@SERVICE_USER@|${SERVICE_USER}|g" \
-  -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" \
-  -e "s|@CONFIG_DIR@|${CONFIG_DIR}|g" \
-  "${SCRIPT_DIR}/html2pdf.service" > "/etc/systemd/system/${SERVICE_NAME}.service"
+validate_json() {
+  node -e 'const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));' "$1"
+}
+validate_json "${INSTALL_DIR}/master-key.json"
+validate_json "${INSTALL_DIR}/apikeys.json"
+validate_json "${INSTALL_DIR}/api-key-metadata.json"
+node -e '
+  const fs = require("fs");
+  const master = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const keys = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const metadata = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+  if (!master || typeof master.key !== "string" || !master.key) throw new Error("Invalid master-key.json");
+  if (!Array.isArray(keys) || keys.some(key => typeof key !== "string")) throw new Error("Invalid apikeys.json");
+  if (!metadata || Array.isArray(metadata) || typeof metadata !== "object") throw new Error("Invalid api-key-metadata.json");
+' "${INSTALL_DIR}/master-key.json" "${INSTALL_DIR}/apikeys.json" "${INSTALL_DIR}/api-key-metadata.json"
 
+# Only application artifacts are replaced; production state remains in place.
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/server.js" "${INSTALL_DIR}/server.js"
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/key-store.js" "${INSTALL_DIR}/key-store.js"
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package.json" "${INSTALL_DIR}/package.json"
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package-lock.json" "${INSTALL_DIR}/package-lock.json"
+runuser -u pdf -- npm --prefix "${INSTALL_DIR}" ci --omit=dev --ignore-scripts
+
+chown -R pdf:pdf "${INSTALL_DIR}"
+chmod 0600 "${INSTALL_DIR}/master-key.json" "${INSTALL_DIR}/apikeys.json" "${INSTALL_DIR}/api-key-metadata.json"
+chmod 0640 "${INSTALL_DIR}/environment"
+node --check "${INSTALL_DIR}/server.js"
+node --check "${INSTALL_DIR}/key-store.js"
+
+if [[ -d "${SCRIPT_DIR}/postman" ]]; then
+  find "${SCRIPT_DIR}/postman" -maxdepth 1 -type f -name '*.json' -exec \
+    install -o pdf -g pdf -m 0644 {} "${INSTALL_DIR}/postman/" \;
+fi
+
+install -o root -g root -m 0644 "${SCRIPT_DIR}/html2pdf.service" "${SERVICE_FILE}"
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}.service"
+systemctl enable html2pdf.service
+systemctl restart html2pdf.service
 
-log "Waiting for the health endpoint"
 for _ in {1..30}; do
-  if curl --silent --fail "http://127.0.0.1:${PORT}/health" >/dev/null; then
-    log "Installation complete; service is healthy on port ${PORT}."
-    if [[ -n "${GENERATED_API_KEY}" ]]; then
-      printf '\nAPI key (save it now): %s\n' "${GENERATED_API_KEY}"
+  if curl --silent --fail http://127.0.0.1:8214/health >/dev/null; then
+    log "Installation complete; service is healthy."
+    if [[ -n "${GENERATED_MASTER_KEY}" ]]; then
+      printf '\nMaster key (save it now; it will not be shown again): %s\n' "${GENERATED_MASTER_KEY}"
     fi
     exit 0
   fi
   sleep 1
 done
-
-systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-journalctl -u "${SERVICE_NAME}.service" -n 50 --no-pager || true
+systemctl --no-pager --full status html2pdf.service || true
 die "The service did not become healthy within 30 seconds."

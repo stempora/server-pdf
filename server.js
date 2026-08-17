@@ -4,6 +4,12 @@ const pLimit = require('p-limit');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const {
+  KeyStore,
+  KeyStoreError,
+  isBearerAuthorized,
+  readJson
+} = require('./key-store');
 
 const MAX_CONCURRENT_REQUESTS =
   parseInt(process.env.MAX_CONCURRENT_REQUESTS, 10) || 20;
@@ -22,7 +28,11 @@ const SHUTDOWN_TIMEOUT_MS =
 
 const API_KEYS_FILE =
   process.env.API_KEYS_FILE || path.join(__dirname, 'apikeys.json');
-const PORT = parseInt(process.env.PORT, 10) || 3000;
+const MASTER_KEY_FILE =
+  process.env.MASTER_KEY_FILE || path.join(__dirname, 'master-key.json');
+const API_KEY_METADATA_FILE =
+  process.env.API_KEY_METADATA_FILE || path.join(__dirname, 'api-key-metadata.json');
+const PORT = parseInt(process.env.PORT, 10) || 8214;
 const LOG_DIR =
   process.env.LOG_DIR || path.join(__dirname, 'logs');
 const CHROME_PATH =
@@ -32,17 +42,24 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-let validKeys;
+let masterKey;
+let keyStore;
 
 try {
-  const raw = fs.readFileSync(API_KEYS_FILE, 'utf8');
-  validKeys = JSON.parse(raw);
+  keyStore = new KeyStore(API_KEYS_FILE, API_KEY_METADATA_FILE);
+  const masterKeyDocument = readJson(MASTER_KEY_FILE);
 
-  if (!Array.isArray(validKeys)) {
-    throw new Error('API key file must contain an array');
+  if (
+    !masterKeyDocument ||
+    typeof masterKeyDocument.key !== 'string' ||
+    masterKeyDocument.key.length === 0
+  ) {
+    throw new Error('Master key file must contain a non-empty `key` string');
   }
+
+  masterKey = masterKeyDocument.key;
 } catch (err) {
-  console.error(`Failed to load API keys from ${API_KEYS_FILE}:`, err);
+  console.error('Failed to load API key configuration:', err.message);
   process.exit(1);
 }
 
@@ -67,7 +84,12 @@ function sanitizeRequestUrl(originalUrl) {
       parsed.searchParams.set('apikey', '[REDACTED]');
     }
 
-    return `${parsed.pathname}${parsed.search}`;
+    const pathname = parsed.pathname.replace(
+      /^(\/admin\/(?:disable|enable|delete)-key\/)[^/]+$/,
+      '$1[REDACTED]'
+    );
+
+    return `${pathname}${parsed.search}`;
   } catch (_err) {
     return originalUrl.replace(
       /([?&]apikey=)[^&]*/gi,
@@ -293,6 +315,7 @@ async function main() {
   const app = express();
 
   app.set('trust proxy', true);
+  app.use(express.json({ limit: '16kb' }));
 
   app.use((req, res, next) => {
     req.requestId =
@@ -313,7 +336,7 @@ async function main() {
       req.query.apikey ||
       req.headers['x-api-key'];
 
-    if (!key || !validKeys.includes(key)) {
+    if (!keyStore.isValid(key)) {
       return res
         .status(401)
         .send(
@@ -322,6 +345,50 @@ async function main() {
     }
 
     next();
+  });
+
+  app.use('/admin', (req, res, next) => {
+    if (!isBearerAuthorized(req.headers.authorization, masterKey)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+
+    next();
+  });
+
+  app.post('/admin/create-key', (req, res, next) => {
+    try {
+      res.status(201).json(keyStore.create(req.body?.name));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/admin/list-keys', (_req, res) => {
+    res.json(keyStore.list());
+  });
+
+  app.post('/admin/disable-key/:key', (req, res, next) => {
+    try {
+      res.json(keyStore.setEnabled(req.params.key, false));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/admin/enable-key/:key', (req, res, next) => {
+    try {
+      res.json(keyStore.setEnabled(req.params.key, true));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/admin/delete-key/:key', (req, res, next) => {
+    try {
+      res.json(keyStore.delete(req.params.key));
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.get('/pdf', (req, res) => {
@@ -478,6 +545,28 @@ async function main() {
         error: err.message
       });
     }
+  });
+
+  app.use((err, req, res, _next) => {
+    const status = err instanceof KeyStoreError
+      ? err.statusCode
+      : err?.status === 400
+        ? 400
+        : 500;
+
+    console.error(
+      `[ADMIN ERROR] requestId=${req.requestId} ` +
+      `type=${err.name || 'Error'} message=${err.message}`
+    );
+
+    res.status(status).json({
+      success: false,
+      error: status === 500
+        ? 'Internal server error'
+        : status === 400 && !(err instanceof KeyStoreError)
+          ? 'Invalid JSON payload'
+          : err.message
+    });
   });
 
   server = app.listen(PORT, () => {
