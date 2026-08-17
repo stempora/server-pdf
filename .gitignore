@@ -5,3 +5,7 @@ master-key.json
 api-key-metadata.json
 environment
 .deployed-commit
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.db

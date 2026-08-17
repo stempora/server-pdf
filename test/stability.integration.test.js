@@ -47,6 +47,7 @@ async function startServer(t, overrides = {}) {
       RENDER_DELAY_MS: '0',
       BROWSER_MAX_REQUESTS: '0',
       BROWSER_MAX_UPTIME_SECONDS: '0',
+      METRICS_ENABLED: 'false',
       ...overrides
     },
     stdio: ['pipe', 'pipe', 'pipe']

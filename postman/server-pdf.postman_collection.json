@@ -137,6 +137,60 @@
           ] } }]
         }
       ]
+    },
+    {
+      "name": "Metrics",
+      "item": [
+        {
+          "name": "List API keys with metrics",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/list-keys"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('master authentication is required', () => pm.response.to.have.status(200));",
+            "pm.test('response is JSON', () => pm.response.to.be.json);",
+            "const response = pm.response.json();",
+            "pm.test('keys contain metrics', () => { const item = response.keys[0]; pm.expect(item).to.have.property('request_count'); pm.expect(item).to.have.property('average_duration_ms'); });"
+          ] } }]
+        },
+        {
+          "name": "Get metrics summary",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/metrics?limit=100&offset=0"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('metrics summary structure is valid', () => { const body = pm.response.json(); pm.expect(body.success).to.eql(true); pm.expect(body.metrics).to.be.an('array'); });"
+          ] } }]
+        },
+        {
+          "name": "Get daily metrics",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/metrics/daily?from={{metrics_from}}&to={{metrics_to}}&fingerprint={{key_fingerprint}}"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('date filters are echoed', () => { const body = pm.response.json(); pm.expect(body.from).to.eql(pm.environment.get('metrics_from')); pm.expect(body.to).to.eql(pm.environment.get('metrics_to')); pm.expect(body.metrics).to.be.an('array'); });"
+          ] } }]
+        },
+        {
+          "name": "Reject invalid metrics fingerprint",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/metrics/daily?fingerprint=invalid"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('invalid fingerprint is rejected', () => pm.response.to.have.status(400));"
+          ] } }]
+        }
+      ]
     }
   ],
   "variable": [
@@ -144,6 +198,9 @@
     { "key": "master_key", "value": "", "type": "secret" },
     { "key": "api_key", "value": "", "type": "secret" },
     { "key": "key_name", "value": "postman-test" },
-    { "key": "pdf_url", "value": "https://example.com" }
+    { "key": "pdf_url", "value": "https://example.com" },
+    { "key": "metrics_from", "value": "2026-08-01" },
+    { "key": "metrics_to", "value": "2026-08-17" },
+    { "key": "key_fingerprint", "value": "" }
   ]
 }

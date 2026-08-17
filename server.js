@@ -10,6 +10,7 @@ const {
   isBearerAuthorized,
   readJson
 } = require('./key-store');
+const { MetricsStore, fingerprintApiKey, emptyMetric } = require('./metrics-store');
 
 const MAX_CONCURRENT_REQUESTS =
   parseInt(process.env.MAX_CONCURRENT_REQUESTS, 10) || 20;
@@ -64,6 +65,21 @@ const LOG_DIR =
   process.env.LOG_DIR || path.join(__dirname, 'logs');
 const CHROME_PATH =
   process.env.CHROME_PATH || '/usr/bin/google-chrome-stable';
+const METRICS_DB_FILE =
+  process.env.METRICS_DB_FILE || path.join(__dirname, 'data', 'metrics.sqlite');
+const METRICS_ENABLED = !/^(?:0|false|no)$/i.test(process.env.METRICS_ENABLED || 'true');
+const METRICS_FLUSH_INTERVAL_MS = parseBoundedInteger(
+  'METRICS_FLUSH_INTERVAL_MS', 2000, 100, 60000
+);
+const METRICS_FLUSH_MAX_EVENTS = parseBoundedInteger(
+  'METRICS_FLUSH_MAX_EVENTS', 100, 1, 10000
+);
+const METRICS_MAX_PENDING_EVENTS = parseBoundedInteger(
+  'METRICS_MAX_PENDING_EVENTS', 10000, 100, 1000000
+);
+const METRICS_QUERY_TIMEOUT_MS = parseBoundedInteger(
+  'METRICS_QUERY_TIMEOUT_MS', 1000, 100, 10000
+);
 
 if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -71,6 +87,14 @@ if (!fs.existsSync(LOG_DIR)) {
 
 let masterKey;
 let keyStore;
+const metricsStore = new MetricsStore({
+  file: METRICS_DB_FILE,
+  enabled: METRICS_ENABLED,
+  flushIntervalMs: METRICS_FLUSH_INTERVAL_MS,
+  flushMaxEvents: METRICS_FLUSH_MAX_EVENTS,
+  maxPendingEvents: METRICS_MAX_PENDING_EVENTS,
+  queryTimeoutMs: METRICS_QUERY_TIMEOUT_MS
+});
 
 try {
   keyStore = new KeyStore(API_KEYS_FILE, API_KEY_METADATA_FILE);
@@ -433,6 +457,57 @@ class PdfRequestTimeoutError extends Error {
   }
 }
 
+function keyNameFor(apiKey) {
+  return keyStore.list().keys.find(item => item.key === apiKey)?.name ?? null;
+}
+
+function listKeyMetrics(metric) {
+  const value = { ...emptyMetric(), ...(metric || {}) };
+  return Object.fromEntries([
+    'request_count', 'started_count', 'success_count', 'error_count',
+    'timeout_count', 'queue_rejected_count', 'client_aborted_count',
+    'validation_error_count', 'average_duration_ms', 'min_duration_ms',
+    'max_duration_ms', 'last_used_at', 'last_success_at', 'last_error_at'
+  ].map(name => [name, value[name]]));
+}
+
+function parseDate(value, name) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) {
+    const error = new Error(`${name} must use YYYY-MM-DD`);
+    error.status = 400;
+    throw error;
+  }
+  const date = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+    const error = new Error(`${name} is not a valid date`);
+    error.status = 400;
+    throw error;
+  }
+  return date;
+}
+
+function metricsDateRange(query) {
+  const today = new Date();
+  const defaultFrom = new Date(today.getTime() - 30 * 86400000);
+  const fromText = query.from || defaultFrom.toISOString().slice(0, 10);
+  const toText = query.to || today.toISOString().slice(0, 10);
+  const from = parseDate(fromText, 'from');
+  const to = parseDate(toText, 'to');
+  const days = Math.floor((to - from) / 86400000) + 1;
+  if (days < 1 || days > 366) {
+    const error = new Error('Date range must contain between 1 and 366 days');
+    error.status = 400;
+    throw error;
+  }
+  const fingerprint = query.fingerprint || null;
+  if (fingerprint && !/^[a-f0-9]{64}$/.test(fingerprint)) {
+    const error = new Error('fingerprint must be a SHA-256 hexadecimal value');
+    error.status = 400;
+    throw error;
+  }
+  return { from: fromText, to: toText, fingerprint };
+}
+
 function isRecoverableBrowserError(error) {
   if (!error || error.name === 'TimeoutError') return false;
   const text = `${error.name || ''} ${error.message || ''}`;
@@ -712,6 +787,7 @@ async function shutdown(signal) {
       `[SHUTDOWN] Waiting for ${activePdfOperations} active PDF request(s)`
     );
     await waitForCondition(() => activePdfOperations === 0);
+    await metricsStore.shutdown(2000);
     if (server && typeof server.closeIdleConnections === 'function') {
       server.closeIdleConnections();
     }
@@ -737,6 +813,10 @@ async function shutdown(signal) {
 }
 
 async function main() {
+  await metricsStore.initialize();
+  for (const item of keyStore.list().keys) {
+    metricsStore.record(item.key, item.name, 'registered');
+  }
   await getBrowser();
 
   const app = express();
@@ -771,6 +851,17 @@ async function main() {
         );
     }
 
+    req.apiKey = key;
+    req.apiKeyName = keyNameFor(key);
+    metricsStore.record(key, req.apiKeyName, 'request');
+    let abortRecorded = false;
+    const recordAbort = () => {
+      if (abortRecorded || res.writableEnded) return;
+      abortRecorded = true;
+      metricsStore.record(key, req.apiKeyName, 'client_aborted');
+    };
+    req.once('aborted', recordAbort);
+    res.once('close', recordAbort);
     next();
   });
 
@@ -791,14 +882,74 @@ async function main() {
 
   app.post('/admin/create-key', (req, res, next) => {
     try {
-      res.status(201).json(keyStore.create(req.body?.name));
+      const created = keyStore.create(req.body?.name);
+      metricsStore.record(created.key, created.name, 'registered');
+      res.status(201).json(created);
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/admin/list-keys', (_req, res) => {
-    res.json(keyStore.list());
+  app.get('/admin/list-keys', async (_req, res, next) => {
+    try {
+      const listed = keyStore.list();
+      const fingerprints = listed.keys.map(item => fingerprintApiKey(item.key));
+      const metrics = await metricsStore.metricsForFingerprints(fingerprints);
+      res.json({
+        success: true,
+        keys: listed.keys.map(item => ({
+          ...item,
+          ...listKeyMetrics(metrics.get(fingerprintApiKey(item.key)))
+        }))
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/admin/metrics', async (req, res, next) => {
+    try {
+      const limitValue = Number(req.query.limit || 100);
+      const offset = Number(req.query.offset || 0);
+      if (!Number.isInteger(limitValue) || limitValue < 1 || limitValue > 500 ||
+          !Number.isInteger(offset) || offset < 0) {
+        const error = new Error('limit must be 1-500 and offset must be non-negative');
+        error.status = 400;
+        throw error;
+      }
+      const activeByFingerprint = new Map(
+        keyStore.list().keys.map(item => [fingerprintApiKey(item.key), item])
+      );
+      const rows = await metricsStore.summary(limitValue, offset);
+      res.json({
+        success: true,
+        limit: limitValue,
+        offset,
+        metrics: rows.map(row => {
+          const active = activeByFingerprint.get(row.key_fingerprint);
+          return {
+            ...row,
+            key: active ? active.key : null,
+            key_name: row.key_name ?? active?.name ?? null
+          };
+        })
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/admin/metrics/daily', async (req, res, next) => {
+    try {
+      const filters = metricsDateRange(req.query);
+      res.json({
+        success: true,
+        ...filters,
+        metrics: await metricsStore.daily(filters.from, filters.to, filters.fingerprint)
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.post('/admin/disable-key/:key', (req, res, next) => {
@@ -819,7 +970,10 @@ async function main() {
 
   app.delete('/admin/delete-key/:key', (req, res, next) => {
     try {
-      res.json(keyStore.delete(req.params.key));
+      const name = keyNameFor(req.params.key);
+      const result = keyStore.delete(req.params.key);
+      metricsStore.markDeleted(req.params.key, name);
+      res.json(result);
     } catch (err) {
       next(err);
     }
@@ -836,6 +990,7 @@ async function main() {
 
     try {
       if (!req.query.url) {
+        metricsStore.record(req.apiKey, req.apiKeyName, 'validation_error');
         return res
           .status(400)
           .send('Missing `url` query parameter');
@@ -843,12 +998,14 @@ async function main() {
 
       url = validateTargetUrl(req.query.url);
     } catch (err) {
+      metricsStore.record(req.apiKey, req.apiKeyName, 'validation_error');
       return res
         .status(400)
         .send(`Invalid URL: ${err.message}`);
     }
 
     if (limit.pendingCount >= MAX_QUEUE_SIZE) {
+      metricsStore.record(req.apiKey, req.apiKeyName, 'queue_rejected');
       console.error(
         `[QUEUE FULL] ` +
         `requestId=${req.requestId} ` +
@@ -887,10 +1044,15 @@ async function main() {
 
       activePdfOperations += 1;
       notifyActivityChange();
+      const metricsStartedAt = Date.now();
+      metricsStore.record(req.apiKey, req.apiKeyName, 'started');
       try {
         const pdfBuffer = await generatePdf(
           url,
           req.requestId
+        );
+        metricsStore.record(
+          req.apiKey, req.apiKeyName, 'success', Date.now() - metricsStartedAt
         );
 
         if (
@@ -918,6 +1080,13 @@ async function main() {
             err.name === 'TimeoutError'
               ? 504
               : 500;
+
+          metricsStore.record(
+            req.apiKey,
+            req.apiKeyName,
+            status === 504 ? 'timeout' : 'error',
+            Date.now() - metricsStartedAt
+          );
 
           res
             .status(status)
@@ -988,6 +1157,7 @@ async function main() {
             activePages,
             activePdfOperations
           },
+          metrics: metricsStore.health(),
           memory: process.memoryUsage(),
           uptimeSeconds:
             Math.round(process.uptime())
@@ -1004,9 +1174,7 @@ async function main() {
   app.use((err, req, res, _next) => {
     const status = err instanceof KeyStoreError
       ? err.statusCode
-      : err?.status === 400
-        ? 400
-        : 500;
+      : Number.isInteger(err?.status) ? err.status : 500;
 
     console.error(
       `[ADMIN ERROR] requestId=${req.requestId} ` +
