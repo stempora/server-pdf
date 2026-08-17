@@ -17,6 +17,7 @@ Aplicația rulează ca utilizatorul Linux `pdf`, exclusiv din:
 ├── master-key.json
 ├── apikeys.json
 ├── api-key-metadata.json
+├── .deployed-commit
 ├── logs/
 └── postman/
 ```
@@ -28,8 +29,8 @@ Unitatea systemd este `/etc/systemd/system/html2pdf.service`, iar portul implici
 `install.sh` este destinat exclusiv serverelor noi. Sunt suportate Debian/Ubuntu și AlmaLinux/Rocky Linux/RHEL 8–9 pe `x86_64`. Installerul detectează distribuția din `/etc/os-release`, folosește `apt` sau `dnf`, instalează Node.js 22 și Google Chrome Stable, creează utilizatorul `pdf`, generează cheile inițiale și pornește serviciul:
 
 ```bash
-git clone https://github.com/stempora/server-pdf.git
-cd server-pdf
+sudo git clone https://github.com/stempora/server-pdf.git /home/pdf/server
+cd /home/pdf/server
 sudo ./install.sh
 ```
 
@@ -136,40 +137,35 @@ Dezactivarea, reactivarea și ștergerea au efect imediat, fără restart.
 
 ## Update sigur în producție
 
-`update.sh` actualizează numai o instalare existentă. Nu instalează Node.js sau Chrome, nu creează utilizatori, nu schimbă systemd și nu înlocuiește configurația, cheile sau logurile.
+Repository-ul Git și aplicația instalată sunt același director: `/home/pdf/server`. `update.sh` validează direct fișierele aduse de `git pull`; nu copiază aplicația din alt checkout. Nu instalează Node.js sau Chrome, nu creează utilizatori, nu schimbă systemd și nu înlocuiește configurația, cheile sau logurile.
 
-Din checkout-ul Git destinat deploymentului:
+Fluxul de update este:
 
 ```bash
-git fetch origin
-git switch BRANCH_APROBAT
-git pull --ff-only origin BRANCH_APROBAT
-git status --short
+cd /home/pdf/server
+git pull --ff-only
 sudo ./scripts/create-master-key.sh   # numai la prima migrare
 sudo ./update.sh
 ```
 
-Update-ul refuză un checkout Git murdar, validează sursa și JSON-urile înainte de copiere, creează un backup în `/home/pdf/server-backups/TIMESTAMP`, rulează `npm ci --omit=dev` numai când manifestele s-au schimbat, repornește serviciul și verifică `/health`.
+După primul health check reușit, commitul activ este salvat în `.deployed-commit`. La prima actualizare a unei instalări vechi, updaterul folosește `ORIG_HEAD` numai dacă este un strămoș valid al lui `HEAD`; dacă această bază nu este disponibilă, commitul aflat anterior în producție trebuie furnizat explicit:
+
+```bash
+sudo DEPLOYED_COMMIT=SHA_COMMIT_ANTERIOR ./update.sh
+```
+
+Update-ul refuză un repository Git murdar, validează fișierele și JSON-urile deja actualizate, creează un backup în `/home/pdf/server-backups/TIMESTAMP`, rulează `npm ci --omit=dev --ignore-scripts` numai când manifestele diferă între commituri, repornește serviciul și verifică `/health`.
 
 ## Backup și rollback
 
-Dacă instalarea, restartul sau health check-ul eșuează după începerea copierii, `update.sh` restaurează automat fișierele aplicației și `node_modules` din backup, apoi repornește versiunea anterioară. Backup-ul este păstrat și locația sa este afișată.
+Dacă validarea, instalarea dependențelor, restartul sau health check-ul eșuează, `update.sh` revine cu `git reset --hard` la commitul din `.deployed-commit`, restaurează `node_modules` când a fost modificat și verifică versiunea veche. Fișierele ignorate — configurația, cheile și logurile — nu sunt șterse și nu se folosește `git clean`.
 
-Pentru rollback manual, înlocuiți `BACKUP_TIMESTAMP` cu directorul afișat de updater:
+Rollback-ul automat este recomandat. După un rollback reușit, retry-ul este:
 
 ```bash
-sudo systemctl stop html2pdf
-sudo cp -a /home/pdf/server-backups/BACKUP_TIMESTAMP/server.js /home/pdf/server/server.js
-sudo cp -a /home/pdf/server-backups/BACKUP_TIMESTAMP/key-store.js /home/pdf/server/key-store.js
-sudo cp -a /home/pdf/server-backups/BACKUP_TIMESTAMP/package.json /home/pdf/server/package.json
-sudo cp -a /home/pdf/server-backups/BACKUP_TIMESTAMP/package-lock.json /home/pdf/server/package-lock.json
-if sudo test -d /home/pdf/server-backups/BACKUP_TIMESTAMP/node_modules; then
-  sudo rm -rf /home/pdf/server/node_modules
-  sudo cp -a /home/pdf/server-backups/BACKUP_TIMESTAMP/node_modules /home/pdf/server/node_modules
-fi
-sudo chown -R pdf:pdf /home/pdf/server
-sudo systemctl start html2pdf
-curl --fail http://127.0.0.1:8214/health
+cd /home/pdf/server
+git pull --ff-only
+sudo ./update.sh
 ```
 
 Fișierele `environment`, `master-key.json`, `apikeys.json`, `api-key-metadata.json` și `logs/` nu sunt înlocuite de updater.

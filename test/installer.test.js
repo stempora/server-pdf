@@ -15,7 +15,8 @@ test('installer uses only the production application path', () => {
   assert.match(installer, /INSTALL_DIR="\/home\/pdf\/server"/);
   assert.doesNotMatch(installer, /\/opt\/html2pdf|\/etc\/html2pdf/);
   assert.doesNotMatch(updater, /\/opt\/html2pdf|\/etc\/html2pdf/);
-  assert.match(installer, /existing installation was found; use update\.sh instead/i);
+  assert.match(installer, /Clone the repository into \/home\/pdf\/server/);
+  assert.match(installer, /\.deployed-commit/);
 });
 
 test('installer has separate DEB and RPM paths for supported distributions', () => {
@@ -54,19 +55,35 @@ test('systemd unit retains all existing production tuning', () => {
   ]) assert.ok(service.includes(setting), `Missing ${setting}`);
 });
 
-test('update has clean-tree preflight, backup, health check and rollback', () => {
+test('update runs in-place with commit-based preflight and no application copying', () => {
+  assert.match(updater, /\[\[ "\$\(pwd -P\)" == "\/home\/pdf\/server" \]\]/);
+  assert.match(updater, /\[\[ -d \.git \]\]/);
   assert.match(updater, /status --porcelain --untracked-files=all/);
+  assert.match(updater, /MARKER_FILE="\$\{INSTALL_DIR\}\/\.deployed-commit"/);
+  assert.match(updater, /DEPLOYED_COMMIT=SHA/);
+  assert.match(updater, /ORIG_HEAD\^\{commit\}/);
+  assert.match(updater, /merge-base --is-ancestor/);
+  assert.match(updater, /cat-file -e "\$\{OLD_COMMIT\}\^\{commit\}"/);
+  assert.match(updater, /Nothing to update/);
+  assert.match(updater, /git_safe diff --quiet "\$\{OLD_COMMIT\}" "\$\{NEW_COMMIT\}" -- package\.json package-lock\.json/);
+  assert.doesNotMatch(updater, /install[^\n]+(server\.js|key-store\.js|package\.json|package-lock\.json|postman)/i);
+  assert.doesNotMatch(updater, /cp[^\n]+(server\.js|key-store\.js|package\.json|package-lock\.json|postman)/i);
+});
+
+test('update backs up dependencies, marks success, and rolls back safely', () => {
   assert.match(updater, /BACKUP_ROOT="\/home\/pdf\/server-backups"/);
   assert.match(updater, /trap rollback ERR/);
   assert.match(updater, /curl --silent --fail http:\/\/127\.0\.0\.1:8214\/health/);
+  assert.match(updater, /npm ci --omit=dev --ignore-scripts/);
   assert.match(updater, /Dependencies unchanged; skipping npm ci/);
-  assert.doesNotMatch(updater, /install\.sh|rsync\s+[^\n]*--delete/);
-
-  for (const preserved of ['environment', 'master-key.json', 'apikeys.json', 'api-key-metadata.json']) {
-    assert.doesNotMatch(updater, new RegExp(`install[^\\n]+${preserved.replace('.', '\\.')}[^\\n]+\\$\\{INSTALL_DIR\\}`));
-  }
-  assert.ok(updater.indexOf('node --check "${SCRIPT_DIR}/server.js"') < updater.indexOf('CHANGES_STARTED=1'));
-  assert.ok(updater.indexOf('validate_json "${INSTALL_DIR}/apikeys.json"') < updater.indexOf('CHANGES_STARTED=1'));
+  assert.match(updater, /git_safe reset --hard "\$\{OLD_COMMIT\}"/);
+  assert.match(updater, /status --porcelain --untracked-files=no/);
+  assert.match(updater, /rollback safety checks failed; git reset was not executed/);
+  assert.doesNotMatch(updater, /git(?:_safe)? clean|rsync\s+[^\n]*--delete/);
+  assert.ok(updater.indexOf('wait_for_health\nwrite_deployed_commit "${NEW_COMMIT}"') > updater.indexOf('systemctl restart "${SERVICE}"'));
+  assert.match(updater, /write_deployed_commit "\$\{OLD_COMMIT\}"/);
+  assert.match(updater, /Retry with: git pull --ff-only && sudo \.\/update\.sh/);
+  assert.ok(updater.indexOf('Nothing to update') < updater.indexOf('timestamp="$(date -u'));
 });
 
 test('secret and runtime files are ignored without removing existing rules', () => {
@@ -76,6 +93,7 @@ test('secret and runtime files are ignored without removing existing rules', () 
     'apikeys.json',
     'master-key.json',
     'api-key-metadata.json',
-    'environment'
+    'environment',
+    '.deployed-commit'
   ]) assert.ok(ignore.split(/\r?\n/).includes(rule), `Missing ${rule}`);
 });

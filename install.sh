@@ -7,6 +7,7 @@ SERVICE_FILE="/etc/systemd/system/html2pdf.service"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STAGING_DIR=""
 GENERATED_MASTER_KEY=""
+INSTALL_COMMIT=""
 
 log() { printf '[html2pdf] %s\n' "$*"; }
 die() { printf '[html2pdf] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -14,7 +15,9 @@ cleanup() { [[ -z "${STAGING_DIR}" ]] || rm -rf -- "${STAGING_DIR}"; }
 trap cleanup EXIT
 
 [[ "${EUID}" -eq 0 ]] || die "Run this installer as root (sudo ./install.sh)."
-[[ ! -e "${INSTALL_DIR}/server.js" ]] || die "An existing installation was found; use update.sh instead."
+[[ "$(pwd -P)" == "/home/pdf/server" && -d .git ]] || die "Clone the repository into /home/pdf/server and run install.sh from there."
+[[ ! -e "${INSTALL_DIR}/environment" && ! -e "${SERVICE_FILE}" ]] || die "An existing installation was found; use update.sh instead."
+INSTALL_COMMIT="$(git -c safe.directory="${INSTALL_DIR}" rev-parse --verify HEAD^{commit})" || die "HEAD is not a valid commit."
 [[ -r /etc/os-release ]] || die "Cannot detect the Linux distribution (/etc/os-release is missing)."
 
 # shellcheck disable=SC1091
@@ -173,6 +176,11 @@ for _ in {1..30}; do
     if [[ -n "${GENERATED_MASTER_KEY}" ]]; then
       printf '\nMaster key (save it now; it will not be shown again): %s\n' "${GENERATED_MASTER_KEY}"
     fi
+    deployed_commit_temp="$(mktemp "${INSTALL_DIR}/.deployed-commit.XXXXXX")"
+    printf '%s\n' "${INSTALL_COMMIT}" > "${deployed_commit_temp}"
+    chown pdf:pdf "${deployed_commit_temp}"
+    chmod 0600 "${deployed_commit_temp}"
+    mv -f -- "${deployed_commit_temp}" "${INSTALL_DIR}/.deployed-commit"
     exit 0
   fi
   sleep 1
