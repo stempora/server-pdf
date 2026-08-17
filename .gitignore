@@ -1,3 +1,7 @@
 logs/
 node_modules/
 apikeys.json
+master-key.json
+api-key-metadata.json
+environment
+.deployed-commit

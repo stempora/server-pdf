@@ -1,0 +1,149 @@
+{
+  "info": {
+    "_postman_id": "23da9df5-b0f3-4142-b681-ed908bf5f37f",
+    "name": "server-pdf",
+    "description": "Health, PDF generation and API-key administration for server-pdf.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/health" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('response is JSON', () => pm.response.to.be.json);"
+          ] } }]
+        }
+      ]
+    },
+    {
+      "name": "PDF",
+      "item": [
+        {
+          "name": "Generate PDF",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}", "type": "text" }],
+            "url": { "raw": "{{base_url}}/pdf?url={{pdf_url}}", "host": ["{{base_url}}"], "path": ["pdf"], "query": [{ "key": "url", "value": "{{pdf_url}}" }] }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('response is PDF', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('application/pdf'));"
+          ] } }]
+        }
+      ]
+    },
+    {
+      "name": "Admin Keys",
+      "item": [
+        {
+          "name": "Create API key",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" },
+              { "key": "Content-Type", "value": "application/json", "type": "text" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{key_name}}\"\n}" },
+            "url": "{{base_url}}/admin/create-key"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 201', () => pm.response.to.have.status(201));",
+            "pm.test('response is JSON', () => pm.response.to.be.json);",
+            "const response = pm.response.json();",
+            "pm.test('success is true', () => pm.expect(response.success).to.eql(true));",
+            "pm.test('complete key is returned', () => pm.expect(response.key).to.match(/^[a-f0-9]{64}$/));",
+            "if (response.key) { pm.environment.set('api_key', response.key); }"
+          ] } }]
+        },
+        {
+          "name": "List API keys",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/list-keys"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('response is JSON', () => pm.response.to.be.json);",
+            "const response = pm.response.json();",
+            "pm.test('success is true', () => pm.expect(response.success).to.eql(true));",
+            "pm.test('complete key appears in list', () => pm.expect(response.keys.some(item => item.key === pm.environment.get('api_key'))).to.eql(true));"
+          ] } }]
+        },
+        {
+          "name": "Disable API key",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/disable-key/{{api_key}}"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "const response = pm.response.json();",
+            "pm.test('key is disabled', () => { pm.expect(response.success).to.eql(true); pm.expect(response.enabled).to.eql(false); });"
+          ] } }]
+        },
+        {
+          "name": "Disabled key is refused",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}", "type": "text" }],
+            "url": { "raw": "{{base_url}}/pdf?url={{pdf_url}}", "host": ["{{base_url}}"], "path": ["pdf"], "query": [{ "key": "url", "value": "{{pdf_url}}" }] }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('disabled key is refused', () => pm.response.to.have.status(401));"
+          ] } }]
+        },
+        {
+          "name": "Enable API key",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/enable-key/{{api_key}}"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "const response = pm.response.json();",
+            "pm.test('key is enabled', () => { pm.expect(response.success).to.eql(true); pm.expect(response.enabled).to.eql(true); });"
+          ] } }]
+        },
+        {
+          "name": "Delete API key",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/delete-key/{{api_key}}"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "pm.test('success is true', () => pm.expect(pm.response.json().success).to.eql(true));"
+          ] } }]
+        },
+        {
+          "name": "Deleted key is absent",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{master_key}}", "type": "text" }],
+            "url": "{{base_url}}/admin/list-keys"
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('status is 200', () => pm.response.to.have.status(200));",
+            "const response = pm.response.json();",
+            "pm.test('deleted key is absent', () => pm.expect(response.keys.some(item => item.key === pm.environment.get('api_key'))).to.eql(false));"
+          ] } }]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8214" },
+    { "key": "master_key", "value": "", "type": "secret" },
+    { "key": "api_key", "value": "", "type": "secret" },
+    { "key": "key_name", "value": "postman-test" },
+    { "key": "pdf_url", "value": "https://example.com" }
+  ]
+}
