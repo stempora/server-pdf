@@ -69,7 +69,7 @@ async function start(t, overrides = {}, corruptMetrics = false) {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   return {
-    base, child, output: () => output,
+    base, child, metricsFile, output: () => output,
     pdf: (target, key = 'metrics-key') => fetch(
       `${base}/pdf?url=${encodeURIComponent(target)}`,
       { headers: { 'X-API-Key': key, Connection: 'close' } }
@@ -162,4 +162,46 @@ test('corrupt metrics database is fail-open for PDF and health', async t => {
   assert.equal(health.browser, 'connected');
   assert.equal(health.metrics.status, 'error');
   assert.equal(typeof health.metrics.lastError, 'string');
+});
+
+test('a SQLite write lock cannot block the HTTP event loop', async t => {
+  const server = await start(t, { METRICS_QUERY_TIMEOUT_MS: '250' });
+  const locker = spawn(process.execPath, ['-e', `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(process.argv[1]);
+    db.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE');
+    console.log('locked');
+    process.stdin.once('data', () => { db.exec('ROLLBACK'); db.close(); process.exit(0); });
+    setTimeout(() => {}, 10000);
+  `, server.metricsFile], { stdio: ['pipe', 'pipe', 'inherit'] });
+  t.after(async () => {
+    if (locker.exitCode === null) {
+      locker.stdin.end('release');
+      await new Promise(resolve => locker.once('exit', resolve));
+    }
+  });
+  await new Promise(resolve => locker.stdout.once('data', resolve));
+
+  assert.equal((await server.pdf('https://example.com/')).status, 200);
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  const started = Date.now();
+  const [health, ordinaryHttp] = await Promise.all([
+    fetch(`${server.base}/health`),
+    fetch(`${server.base}/pdf?url=${encodeURIComponent('https://example.com/')}`)
+  ]);
+  const elapsed = Date.now() - started;
+  assert.equal(health.status, 200);
+  assert.equal(ordinaryHttp.status, 401);
+  assert.ok(elapsed < 750, `HTTP event loop was delayed for ${elapsed}ms`);
+
+  const queryStarted = Date.now();
+  const admin = await server.admin('/admin/metrics');
+  assert.equal(admin.status, 503);
+  assert.match((await admin.json()).error, /temporarily unavailable/i);
+  assert.ok(Date.now() - queryStarted < 750, 'admin query timeout was not bounded');
+
+  locker.stdin.end('release');
+  await new Promise(resolve => locker.once('exit', resolve));
+  await new Promise(resolve => setTimeout(resolve, 100));
 });

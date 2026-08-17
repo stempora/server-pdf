@@ -105,7 +105,7 @@ trap rollback ERR
 [[ -d .git ]] || die "/home/pdf/server is not a Git repository."
 exec 9>/run/lock/html2pdf-update.lock
 flock -n 9 || die "Another server-pdf update is already running."
-[[ -f server.js && -f key-store.js && -f metrics-store.js && -f scripts/init-metrics-db.js && -f package.json && -f package-lock.json ]] || die "Application files are incomplete."
+[[ -f server.js && -f key-store.js && -f metrics-store.js && -f metrics-worker.js && -f scripts/init-metrics-db.js && -f package.json && -f package-lock.json ]] || die "Application files are incomplete."
 [[ -d node_modules ]] || die "Existing node_modules directory is missing."
 [[ -f /etc/systemd/system/html2pdf.service ]] || die "Systemd unit is missing."
 systemctl is-active --quiet "${SERVICE}" || die "Service ${SERVICE} is not active."
@@ -160,6 +160,7 @@ ROLLBACK_READY=1
 node --check server.js
 node --check key-store.js
 node --check metrics-store.js
+node --check metrics-worker.js
 node --check scripts/init-metrics-db.js
 node -e 'const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(":memory:"); db.close();'
 validate_json package.json

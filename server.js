@@ -77,6 +77,9 @@ const METRICS_FLUSH_MAX_EVENTS = parseBoundedInteger(
 const METRICS_MAX_PENDING_EVENTS = parseBoundedInteger(
   'METRICS_MAX_PENDING_EVENTS', 10000, 100, 1000000
 );
+const METRICS_QUERY_TIMEOUT_MS = parseBoundedInteger(
+  'METRICS_QUERY_TIMEOUT_MS', 1000, 100, 10000
+);
 
 if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -89,7 +92,8 @@ const metricsStore = new MetricsStore({
   enabled: METRICS_ENABLED,
   flushIntervalMs: METRICS_FLUSH_INTERVAL_MS,
   flushMaxEvents: METRICS_FLUSH_MAX_EVENTS,
-  maxPendingEvents: METRICS_MAX_PENDING_EVENTS
+  maxPendingEvents: METRICS_MAX_PENDING_EVENTS,
+  queryTimeoutMs: METRICS_QUERY_TIMEOUT_MS
 });
 
 try {
@@ -1170,9 +1174,7 @@ async function main() {
   app.use((err, req, res, _next) => {
     const status = err instanceof KeyStoreError
       ? err.statusCode
-      : err?.status === 400
-        ? 400
-        : 500;
+      : Number.isInteger(err?.status) ? err.status : 500;
 
     console.error(
       `[ADMIN ERROR] requestId=${req.requestId} ` +

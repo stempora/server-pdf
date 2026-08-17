@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync, backup } = require('node:sqlite');
+const { Worker } = require('node:worker_threads');
 
 const SCHEMA_VERSION = 1;
 const COUNTERS = [
@@ -175,6 +176,14 @@ function metricResponse(row = {}) {
   return result;
 }
 
+class MetricsQueryError extends Error {
+  constructor(message = 'Metrics temporarily unavailable') {
+    super(message);
+    this.name = 'MetricsQueryError';
+    this.status = 503;
+  }
+}
+
 class MetricsStore {
   constructor(options) {
     this.file = options.file;
@@ -187,7 +196,11 @@ class MetricsStore {
     this.lastFlushAt = null;
     this.lastError = null;
     this.schemaVersion = null;
-    this.db = null;
+    this.worker = null;
+    this.requests = new Map();
+    this.nextRequestId = 1;
+    this.queryTimeoutMs = options.queryTimeoutMs ?? 1000;
+    this.workerTimeoutMs = options.workerTimeoutMs ?? 6000;
     this.flushPromise = null;
     this.timer = null;
   }
@@ -195,8 +208,8 @@ class MetricsStore {
   async initialize() {
     if (!this.enabled) return;
     try {
-      const initialized = await initializeMetricsDatabase(this.file);
-      this.db = initialized.db;
+      this.startWorker();
+      const initialized = await this.request('init', {}, this.queryTimeoutMs);
       this.schemaVersion = initialized.schemaVersion;
       this.lastError = null;
     } catch (error) {
@@ -205,6 +218,50 @@ class MetricsStore {
     }
     this.timer = setInterval(() => void this.flush(), this.flushIntervalMs);
     this.timer.unref();
+  }
+
+  startWorker() {
+    if (this.worker) return;
+    const worker = new Worker(path.join(__dirname, 'metrics-worker.js'), { workerData: { file: this.file } });
+    this.worker = worker;
+    worker.on('message', message => {
+      const pending = this.requests.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.requests.delete(message.id);
+      if (message.ok) pending.resolve(message.result);
+      else pending.reject(new Error(message.error || 'Metrics worker operation failed'));
+    });
+    worker.on('error', error => this.workerFailed(worker, error));
+    worker.on('exit', code => {
+      if (this.worker === worker && code !== 0) this.workerFailed(worker, new Error(`Metrics worker exited with code ${code}`));
+    });
+  }
+
+  workerFailed(worker, error) {
+    if (this.worker !== worker) return;
+    this.worker = null;
+    this.lastError = 'Metrics worker unavailable';
+    for (const pending of this.requests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.requests.clear();
+    console.error(`[METRICS] Worker failed: ${error.message}`);
+  }
+
+  request(type, payload = {}, timeoutMs = this.workerTimeoutMs) {
+    if (!this.worker) return Promise.reject(new Error('Metrics worker unavailable'));
+    const id = this.nextRequestId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.requests.delete(id);
+        reject(new Error('Metrics worker operation timed out'));
+      }, timeoutMs);
+      timer.unref?.();
+      this.requests.set(id, { resolve, reject, timer });
+      this.worker.postMessage({ id, type, ...payload });
+    });
   }
 
   record(apiKey, keyName, type, durationMs) {
@@ -224,13 +281,6 @@ class MetricsStore {
     this.record(apiKey, keyName, 'deleted');
   }
 
-  async ensureOpen() {
-    if (this.db || !this.enabled) return;
-    const initialized = await initializeMetricsDatabase(this.file);
-    this.db = initialized.db;
-    this.schemaVersion = initialized.schemaVersion;
-  }
-
   flush() {
     if (!this.enabled || this.pending.length === 0) return Promise.resolve();
     if (this.flushPromise) return this.flushPromise;
@@ -241,89 +291,9 @@ class MetricsStore {
   async flushBatch() {
     const batch = this.pending.splice(0, this.pending.length);
     try {
-      await this.ensureOpen();
-      const totals = new Map();
-      const daily = new Map();
-      for (const event of batch) {
-        if (!totals.has(event.fingerprint)) {
-          totals.set(event.fingerprint, { ...emptyMetric(), key_name: event.keyName, deleted_at: null });
-        }
-        addEvent(totals.get(event.fingerprint), event);
-        if (event.type !== 'registered' && event.type !== 'deleted') {
-          const dayKey = `${event.fingerprint}:${event.at.slice(0, 10)}`;
-          if (!daily.has(dayKey)) daily.set(dayKey, { ...emptyMetric(), fingerprint: event.fingerprint, date: event.at.slice(0, 10) });
-          addEvent(daily.get(dayKey), event);
-        }
-      }
-      const totalStatement = this.db.prepare(`
-        INSERT INTO api_key_metrics (
-          key_fingerprint, key_name, request_count, started_count, success_count,
-          error_count, timeout_count, queue_rejected_count, client_aborted_count,
-          validation_error_count, total_duration_ms, min_duration_ms, max_duration_ms,
-          last_used_at, last_success_at, last_error_at, deleted_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(key_fingerprint) DO UPDATE SET
-          key_name=COALESCE(excluded.key_name, key_name),
-          request_count=request_count+excluded.request_count,
-          started_count=started_count+excluded.started_count,
-          success_count=success_count+excluded.success_count,
-          error_count=error_count+excluded.error_count,
-          timeout_count=timeout_count+excluded.timeout_count,
-          queue_rejected_count=queue_rejected_count+excluded.queue_rejected_count,
-          client_aborted_count=client_aborted_count+excluded.client_aborted_count,
-          validation_error_count=validation_error_count+excluded.validation_error_count,
-          total_duration_ms=total_duration_ms+excluded.total_duration_ms,
-          min_duration_ms=CASE WHEN excluded.min_duration_ms IS NULL THEN min_duration_ms WHEN min_duration_ms IS NULL THEN excluded.min_duration_ms ELSE MIN(min_duration_ms, excluded.min_duration_ms) END,
-          max_duration_ms=CASE WHEN excluded.max_duration_ms IS NULL THEN max_duration_ms WHEN max_duration_ms IS NULL THEN excluded.max_duration_ms ELSE MAX(max_duration_ms, excluded.max_duration_ms) END,
-          last_used_at=COALESCE(excluded.last_used_at, last_used_at),
-          last_success_at=COALESCE(excluded.last_success_at, last_success_at),
-          last_error_at=COALESCE(excluded.last_error_at, last_error_at),
-          deleted_at=COALESCE(excluded.deleted_at, deleted_at), updated_at=excluded.updated_at
-      `);
-      const dailyStatement = this.db.prepare(`
-        INSERT INTO api_key_daily_metrics (
-          key_fingerprint, metric_date, request_count, started_count, success_count,
-          error_count, timeout_count, queue_rejected_count, client_aborted_count,
-          validation_error_count, total_duration_ms, min_duration_ms, max_duration_ms, last_used_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(key_fingerprint, metric_date) DO UPDATE SET
-          request_count=request_count+excluded.request_count,
-          started_count=started_count+excluded.started_count,
-          success_count=success_count+excluded.success_count,
-          error_count=error_count+excluded.error_count,
-          timeout_count=timeout_count+excluded.timeout_count,
-          queue_rejected_count=queue_rejected_count+excluded.queue_rejected_count,
-          client_aborted_count=client_aborted_count+excluded.client_aborted_count,
-          validation_error_count=validation_error_count+excluded.validation_error_count,
-          total_duration_ms=total_duration_ms+excluded.total_duration_ms,
-          min_duration_ms=CASE WHEN excluded.min_duration_ms IS NULL THEN min_duration_ms WHEN min_duration_ms IS NULL THEN excluded.min_duration_ms ELSE MIN(min_duration_ms, excluded.min_duration_ms) END,
-          max_duration_ms=CASE WHEN excluded.max_duration_ms IS NULL THEN max_duration_ms WHEN max_duration_ms IS NULL THEN excluded.max_duration_ms ELSE MAX(max_duration_ms, excluded.max_duration_ms) END,
-          last_used_at=COALESCE(excluded.last_used_at, last_used_at)
-      `);
-      const now = new Date().toISOString();
-      this.db.exec('BEGIN IMMEDIATE');
-      try {
-        for (const [fingerprint, metric] of totals) {
-          totalStatement.run(
-            fingerprint, metric.key_name, ...COUNTERS.map(name => metric[name]),
-            metric.total_duration_ms, metric.min_duration_ms, metric.max_duration_ms,
-            metric.last_used_at, metric.last_success_at, metric.last_error_at,
-            metric.deleted_at, now, now
-          );
-        }
-        for (const metric of daily.values()) {
-          dailyStatement.run(
-            metric.fingerprint, metric.date, ...COUNTERS.map(name => metric[name]),
-            metric.total_duration_ms, metric.min_duration_ms, metric.max_duration_ms,
-            metric.last_used_at
-          );
-        }
-        this.db.exec('COMMIT');
-      } catch (error) {
-        this.db.exec('ROLLBACK');
-        throw error;
-      }
-      this.lastFlushAt = now;
+      if (!this.worker) this.startWorker();
+      const result = await this.request('flush', { events: batch });
+      this.lastFlushAt = result.lastFlushAt;
       this.lastError = null;
     } catch (error) {
       this.lastError = 'Metrics flush failed';
@@ -337,34 +307,24 @@ class MetricsStore {
   }
 
   async metricsForFingerprints(fingerprints) {
-    if (!this.enabled || !this.db || fingerprints.length === 0) return new Map();
-    await this.flush();
-    const statement = this.db.prepare('SELECT * FROM api_key_metrics WHERE key_fingerprint = ?');
-    return new Map(fingerprints.map(fingerprint => [fingerprint, metricResponse(statement.get(fingerprint))]));
+    if (!this.enabled || fingerprints.length === 0) return new Map();
+    void this.flush();
+    try { return new Map(await this.request('fingerprints', { fingerprints }, this.queryTimeoutMs)); }
+    catch (_error) { throw new MetricsQueryError(); }
   }
 
   async summary(limit = 100, offset = 0) {
-    if (!this.enabled || !this.db) return [];
-    await this.flush();
-    return this.db.prepare(`
-      SELECT * FROM api_key_metrics ORDER BY COALESCE(last_used_at, created_at) DESC LIMIT ? OFFSET ?
-    `).all(limit, offset).map(metricResponse);
+    if (!this.enabled) return [];
+    void this.flush();
+    try { return await this.request('summary', { limit, offset }, this.queryTimeoutMs); }
+    catch (_error) { throw new MetricsQueryError(); }
   }
 
   async daily(from, to, fingerprint) {
-    if (!this.enabled || !this.db) return [];
-    await this.flush();
-    if (fingerprint) {
-      return this.db.prepare(`
-        SELECT * FROM api_key_daily_metrics
-        WHERE metric_date BETWEEN ? AND ? AND key_fingerprint = ?
-        ORDER BY metric_date DESC
-      `).all(from, to, fingerprint).map(metricResponse);
-    }
-    return this.db.prepare(`
-      SELECT * FROM api_key_daily_metrics WHERE metric_date BETWEEN ? AND ?
-      ORDER BY metric_date DESC, key_fingerprint
-    `).all(from, to).map(metricResponse);
+    if (!this.enabled) return [];
+    void this.flush();
+    try { return await this.request('daily', { from, to, fingerprint }, this.queryTimeoutMs); }
+    catch (_error) { throw new MetricsQueryError(); }
   }
 
   health() {
@@ -385,14 +345,16 @@ class MetricsStore {
       this.flush().catch(() => {}),
       new Promise(resolve => setTimeout(resolve, timeoutMs))
     ]);
-    if (this.db) {
-      try { this.db.close(); } catch (_error) {}
-      this.db = null;
-    }
+    const worker = this.worker;
+    if (!worker) return;
+    try { await Promise.race([this.request('shutdown', {}, timeoutMs), new Promise(resolve => setTimeout(resolve, timeoutMs))]); }
+    catch (_error) {}
+    if (this.worker === worker) this.worker = null;
+    await worker.terminate().catch(() => {});
   }
 }
 
 module.exports = {
   MetricsStore, SCHEMA_VERSION, fingerprintApiKey, initializeMetricsDatabase,
-  validateSchema, metricResponse, emptyMetric
+  validateSchema, metricResponse, emptyMetric, COUNTERS, addEvent, MetricsQueryError
 };

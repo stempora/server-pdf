@@ -176,3 +176,16 @@ test('disabled metrics creates no database and reports disabled health', async t
   assert.equal(metrics.health().status, 'disabled');
   await metrics.shutdown();
 });
+
+test('worker death degrades metrics without rejecting records', async t => {
+  const files = temporary(t);
+  const metrics = store(files.file);
+  await metrics.initialize();
+  await metrics.worker.terminate();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotThrow(() => metrics.record('still-converts', null, 'request'));
+  assert.equal(metrics.pending.length, 1);
+  assert.equal(metrics.health().status, 'error');
+  assert.match(metrics.health().lastError, /worker unavailable/i);
+  await metrics.shutdown(10);
+});

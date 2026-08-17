@@ -92,11 +92,13 @@ STAGING_DIR="$(mktemp -d /tmp/html2pdf-install.XXXXXX)"
 install -m 0644 "${SCRIPT_DIR}/server.js" "${STAGING_DIR}/server.js"
 install -m 0644 "${SCRIPT_DIR}/key-store.js" "${STAGING_DIR}/key-store.js"
 install -m 0644 "${SCRIPT_DIR}/metrics-store.js" "${STAGING_DIR}/metrics-store.js"
+install -m 0644 "${SCRIPT_DIR}/metrics-worker.js" "${STAGING_DIR}/metrics-worker.js"
 install -m 0644 "${SCRIPT_DIR}/package.json" "${STAGING_DIR}/package.json"
 install -m 0644 "${SCRIPT_DIR}/package-lock.json" "${STAGING_DIR}/package-lock.json"
 node --check "${STAGING_DIR}/server.js"
 node --check "${STAGING_DIR}/key-store.js"
 node --check "${STAGING_DIR}/metrics-store.js"
+node --check "${STAGING_DIR}/metrics-worker.js"
 node --check "${SCRIPT_DIR}/scripts/init-metrics-db.js"
 
 if [[ ! -e "${INSTALL_DIR}/master-key.json" ]]; then
@@ -137,6 +139,7 @@ METRICS_ENABLED=true
 METRICS_FLUSH_INTERVAL_MS=2000
 METRICS_FLUSH_MAX_EVENTS=100
 METRICS_MAX_PENDING_EVENTS=10000
+METRICS_QUERY_TIMEOUT_MS=1000
 PDF_REQUEST_TIMEOUT_MS=60000
 PDF_TIMEOUT_CLEANUP_MS=3000
 BROWSER_MAX_REQUESTS=5000
@@ -168,6 +171,7 @@ node -e '
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/server.js" "${INSTALL_DIR}/server.js"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/key-store.js" "${INSTALL_DIR}/key-store.js"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/metrics-store.js" "${INSTALL_DIR}/metrics-store.js"
+install -o pdf -g pdf -m 0644 "${STAGING_DIR}/metrics-worker.js" "${INSTALL_DIR}/metrics-worker.js"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package.json" "${INSTALL_DIR}/package.json"
 install -o pdf -g pdf -m 0644 "${STAGING_DIR}/package-lock.json" "${INSTALL_DIR}/package-lock.json"
 runuser -u pdf -- npm --prefix "${INSTALL_DIR}" ci --omit=dev --ignore-scripts
@@ -178,6 +182,7 @@ chmod 0640 "${INSTALL_DIR}/environment"
 node --check "${INSTALL_DIR}/server.js"
 node --check "${INSTALL_DIR}/key-store.js"
 node --check "${INSTALL_DIR}/metrics-store.js"
+node --check "${INSTALL_DIR}/metrics-worker.js"
 runuser -u pdf -- node "${INSTALL_DIR}/scripts/init-metrics-db.js"
 chmod 0600 "${INSTALL_DIR}/data/metrics.sqlite"
 
