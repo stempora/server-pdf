@@ -96,6 +96,65 @@ test('total request timeout returns 504, closes its page, and releases the slot'
   assert.equal(server.state().launches, 1, 'Timeout must not trigger browser recovery');
 });
 
+test('timeout cleanup holds the concurrency slot until the original operation stops', async t => {
+  const server = await startServer(t, {
+    PDF_REQUEST_TIMEOUT_MS: '1000',
+    MAX_CONCURRENT_REQUESTS: '1'
+  });
+  const oldTarget = 'https://example.com/?mockDelay=1500&mockContinueAfterClose=1';
+  const timedOut = server.pdf(oldTarget);
+  await waitFor(
+    () => server.state().events.some(event => event.type === 'pdf-start'),
+    'Timed operation did not start'
+  );
+  const next = server.pdf('https://example.org/');
+
+  assert.equal((await timedOut).status, 504);
+  assert.equal((await next).status, 200);
+
+  const state = server.state();
+  const oldEnd = state.events.findIndex(event =>
+    event.type === 'pdf-end' && event.targetUrl.includes('mockContinueAfterClose=1')
+  );
+  const nextStart = state.events.findIndex(event =>
+    event.type === 'pdf-start' && event.targetUrl === 'https://example.org/'
+  );
+  assert.ok(oldEnd >= 0 && nextStart > oldEnd, 'Next operation started before timed-out Puppeteer work ended');
+  assert.equal(
+    state.events.filter(event =>
+      event.type === 'page-close-attempt' && event.targetUrl.includes('mockContinueAfterClose=1')
+    ).length,
+    1
+  );
+  assert.equal(state.maxActivePdfCalls, 1);
+  assert.equal(state.launches, 1, 'Timeout cleanup must not retry');
+
+  const health = await (await fetch(`${server.base}/health`)).json();
+  assert.deepEqual(health.operations, { activePages: 0, activePdfOperations: 0 });
+});
+
+test('failed page close recycles the affected browser and still returns 504', async t => {
+  const server = await startServer(t, {
+    PDF_REQUEST_TIMEOUT_MS: '1000',
+    MAX_CONCURRENT_REQUESTS: '1'
+  });
+  const response = await server.pdf(
+    'https://example.com/?mockDelay=5000&mockCloseFails=1'
+  );
+  assert.equal(response.status, 504);
+  assert.equal(server.state().launches, 2);
+  assert.equal(
+    server.state().events.filter(event => event.type === 'page-close-attempt').length,
+    1,
+    'Timeout and finally must share the same close promise'
+  );
+  assert.equal(server.state().maxActivePdfCalls, 1);
+  assert.doesNotMatch(server.output(), /Chrome ready; retrying request/);
+  assert.equal((await server.pdf('https://example.org/')).status, 200);
+  const health = await (await fetch(`${server.base}/health`)).json();
+  assert.deepEqual(health.operations, { activePages: 0, activePdfOperations: 0 });
+});
+
 test('recoverable browser failures share one relaunch and get one retry', async t => {
   const server = await startServer(t, { PDF_REQUEST_TIMEOUT_MS: '5000' });
   const responses = await Promise.all([

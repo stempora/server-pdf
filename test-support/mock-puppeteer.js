@@ -3,6 +3,8 @@ const fs = require('node:fs');
 
 const originalLoad = Module._load;
 let generation = 0;
+let activePdfCalls = 0;
+let maxActivePdfCalls = 0;
 
 if (process.env.MOCK_SIGNAL_STDIN === '1') {
   process.stdin.setEncoding('utf8');
@@ -16,6 +18,8 @@ function record(type, details = {}) {
     state = JSON.parse(fs.readFileSync(process.env.MOCK_PUPPETEER_STATE_FILE, 'utf8'));
   } catch (_error) {}
   if (type === 'launch') state.launches += 1;
+  state.activePdfCalls = activePdfCalls;
+  state.maxActivePdfCalls = Math.max(state.maxActivePdfCalls || 0, maxActivePdfCalls);
   state.events.push({ type, generation, at: Date.now(), ...details });
   fs.writeFileSync(process.env.MOCK_PUPPETEER_STATE_FILE, JSON.stringify(state));
 }
@@ -41,6 +45,7 @@ Module._load = function load(request, parent, isMain) {
       const thisGeneration = generation;
       let connected = true;
       let activePages = 0;
+      const browserPageStates = new Set();
       record('launch');
       return {
         on() {},
@@ -49,11 +54,15 @@ Module._load = function load(request, parent, isMain) {
         close: async () => {
           connected = false;
           record('browser-close', { activePages, browserGeneration: thisGeneration });
+          for (const pageState of browserPageStates) {
+            if (pageState.rejectDelay) pageState.rejectDelay();
+          }
         },
         newPage: async () => {
           let closed = false;
           let targetUrl = '';
           const pageState = { rejectDelay: null };
+          browserPageStates.add(pageState);
           activePages += 1;
           record('page-open', { browserGeneration: thisGeneration });
           return {
@@ -62,26 +71,45 @@ Module._load = function load(request, parent, isMain) {
             goto: async url => { targetUrl = url; },
             evaluate: async () => {},
             pdf: async () => {
-              const parsed = new URL(targetUrl);
-              const delayMs = Number(parsed.searchParams.get('mockDelay') || 0);
-              if (delayMs > 0) await delay(delayMs, pageState);
-              if (parsed.searchParams.get('mockError') === 'recoverable' && thisGeneration === 1) {
-                const error = new Error('Browser disconnected');
-                error.name = 'TargetClosedError';
-                throw error;
+              activePdfCalls += 1;
+              maxActivePdfCalls = Math.max(maxActivePdfCalls, activePdfCalls);
+              record('pdf-start', { targetUrl, browserGeneration: thisGeneration });
+              try {
+                const parsed = new URL(targetUrl);
+                const delayMs = Number(parsed.searchParams.get('mockDelay') || 0);
+                if (delayMs > 0) await delay(delayMs, pageState);
+                if (parsed.searchParams.get('mockError') === 'recoverable' && thisGeneration === 1) {
+                  const error = new Error('Browser disconnected');
+                  error.name = 'TargetClosedError';
+                  throw error;
+                }
+                if (parsed.searchParams.get('mockError') === 'normal') {
+                  throw new Error('Page render failed');
+                }
+                return Buffer.from('%PDF-1.4\nmock\n');
+              } finally {
+                activePdfCalls -= 1;
+                browserPageStates.delete(pageState);
+                record('pdf-end', { targetUrl, browserGeneration: thisGeneration });
               }
-              if (parsed.searchParams.get('mockError') === 'normal') {
-                throw new Error('Page render failed');
-              }
-              return Buffer.from('%PDF-1.4\nmock\n');
             },
             isClosed: () => closed,
             close: async () => {
               if (closed) return;
+              record('page-close-attempt', { targetUrl, browserGeneration: thisGeneration });
+              const parsed = targetUrl ? new URL(targetUrl) : null;
+              if (parsed?.searchParams.get('mockCloseFails') === '1') {
+                throw new Error('Mock page close failed');
+              }
               closed = true;
               activePages -= 1;
               record('page-close', { browserGeneration: thisGeneration });
-              if (pageState.rejectDelay) pageState.rejectDelay();
+              if (
+                parsed?.searchParams.get('mockContinueAfterClose') !== '1' &&
+                pageState.rejectDelay
+              ) {
+                pageState.rejectDelay();
+              }
             }
           };
         }
