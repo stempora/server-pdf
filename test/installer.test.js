@@ -9,6 +9,7 @@ const installer = read('install.sh');
 const updater = read('update.sh');
 const service = read('html2pdf.service');
 const ignore = read('.gitignore');
+const watchdogInstaller = read('scripts/install-watchdog.sh');
 
 test('installer uses only the production application path', () => {
   assert.match(installer, /SERVICE_USER="pdf"/);
@@ -39,6 +40,20 @@ test('installer creates secrets only when absent and secures them', () => {
   assert.match(installer, /openssl rand -hex 32/);
   assert.match(installer, /chmod 0600 .*master-key\.json.*apikeys\.json.*api-key-metadata\.json/);
   assert.match(installer, /Master key \(save it now; it will not be shown again\)/);
+});
+
+test('installer adds stability defaults only to a newly created environment and enables watchdog after health', () => {
+  for (const setting of [
+    'PDF_REQUEST_TIMEOUT_MS=60000',
+    'PDF_TIMEOUT_CLEANUP_MS=3000',
+    'BROWSER_MAX_REQUESTS=5000',
+    'BROWSER_MAX_UPTIME_SECONDS=21600',
+    'WATCHDOG_FAILURE_THRESHOLD=2',
+    'WATCHDOG_RESTART_COOLDOWN_SECONDS=60'
+  ]) assert.ok(installer.includes(setting), `Missing ${setting}`);
+  assert.ok(installer.indexOf('scripts/install-watchdog.sh') > installer.indexOf('curl --silent --fail http://127.0.0.1:8214/health'));
+  assert.doesNotMatch(updater, /install-watchdog|html2pdf-watchdog/);
+  assert.doesNotMatch(watchdogInstaller, /(?:restart|start) html2pdf\.service/);
 });
 
 test('systemd unit retains all existing production tuning', () => {

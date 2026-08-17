@@ -26,6 +26,33 @@ const RENDER_DELAY_MS =
 const SHUTDOWN_TIMEOUT_MS =
   parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 15000;
 
+function parseBoundedInteger(name, defaultValue, minimum, maximum) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || rawValue === '') {
+    return defaultValue;
+  }
+  const value = Number(rawValue);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(
+      `${name} must be an integer between ${minimum} and ${maximum}`
+    );
+  }
+  return value;
+}
+
+const PDF_REQUEST_TIMEOUT_MS = parseBoundedInteger(
+  'PDF_REQUEST_TIMEOUT_MS', 60000, 1000, 300000
+);
+const BROWSER_MAX_REQUESTS = parseBoundedInteger(
+  'BROWSER_MAX_REQUESTS', 5000, 0, 1000000
+);
+const BROWSER_MAX_UPTIME_SECONDS = parseBoundedInteger(
+  'BROWSER_MAX_UPTIME_SECONDS', 21600, 0, 604800
+);
+const PDF_TIMEOUT_CLEANUP_MS = parseBoundedInteger(
+  'PDF_TIMEOUT_CLEANUP_MS', 3000, 100, 30000
+);
+
 const API_KEYS_FILE =
   process.env.API_KEYS_FILE || path.join(__dirname, 'apikeys.json');
 const MASTER_KEY_FILE =
@@ -67,8 +94,16 @@ const limit = pLimit(MAX_CONCURRENT_REQUESTS);
 
 let browser = null;
 let browserLaunchPromise = null;
+let browserTransitionPromise = null;
 let server = null;
 let shuttingDown = false;
+let browserLaunchedAt = 0;
+let browserProcessedRequests = 0;
+let recyclePending = false;
+let activePages = 0;
+let activePdfOperations = 0;
+const queuedPdfRequests = new Set();
+const activityWaiters = new Set();
 
 let currentDate = new Date().toISOString().slice(0, 10);
 let logStream = fs.createWriteStream(
@@ -154,28 +189,222 @@ async function launchBrowser() {
   });
 
   browser = launchedBrowser;
+  browserLaunchedAt = Date.now();
+  browserProcessedRequests = 0;
+  recyclePending = false;
 
   console.log('[BROWSER] Chrome ready');
 
   return launchedBrowser;
 }
 
-async function getBrowser() {
-  if (shuttingDown) {
-    throw new Error('Service is shutting down');
+function notifyActivityChange() {
+  for (const waiter of activityWaiters) {
+    waiter();
   }
+}
 
+function waitForCondition(predicate) {
+  if (predicate()) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    const check = () => {
+      if (!predicate()) return;
+      activityWaiters.delete(check);
+      resolve();
+    };
+    activityWaiters.add(check);
+  });
+}
+
+function settleWithin(promise, timeoutMs) {
+  if (timeoutMs <= 0) {
+    promise.catch(() => {});
+    return Promise.resolve({ settled: false });
+  }
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve({ settled: false }), timeoutMs);
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve({ settled: true, value });
+      },
+      error => {
+        clearTimeout(timer);
+        resolve({ settled: true, error });
+      }
+    );
+  });
+}
+
+function remainingUntil(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function closeBrowserInstance(instance) {
+  if (!instance) return;
+  try {
+    if (instance.isConnected()) {
+      await instance.close();
+    }
+  } catch (err) {
+    console.error(`[BROWSER] Close error: ${err.message}`);
+  } finally {
+    if (browser === instance) {
+      browser = null;
+    }
+  }
+}
+
+async function getOrLaunchBrowser() {
+  if (browserTransitionPromise) {
+    await browserTransitionPromise;
+  }
   if (browser && browser.isConnected()) {
     return browser;
   }
-
   if (!browserLaunchPromise) {
     browserLaunchPromise = launchBrowser().finally(() => {
       browserLaunchPromise = null;
     });
   }
-
   return browserLaunchPromise;
+}
+
+function browserUptimeLimitReached() {
+  return BROWSER_MAX_UPTIME_SECONDS > 0 &&
+    browserLaunchedAt > 0 &&
+    Date.now() - browserLaunchedAt >= BROWSER_MAX_UPTIME_SECONDS * 1000;
+}
+
+function scheduleBrowserRecycle() {
+  if (recyclePending || shuttingDown) return;
+  recyclePending = true;
+  console.log(
+    `[BROWSER RECYCLE] Scheduled after ${browserProcessedRequests} requests`
+  );
+}
+
+function recycleBrowser() {
+  if (!recyclePending || shuttingDown) {
+    return Promise.resolve(browser);
+  }
+  if (browserTransitionPromise) {
+    return browserTransitionPromise;
+  }
+  browserTransitionPromise = (async () => {
+    await waitForCondition(() => activePages === 0 || shuttingDown);
+    if (shuttingDown) return browser;
+    const oldBrowser = browser;
+    console.log('[BROWSER RECYCLE] Closing old browser');
+    await closeBrowserInstance(oldBrowser);
+    await launchBrowser();
+    console.log('[BROWSER RECYCLE] New browser ready');
+    return browser;
+  })().finally(() => {
+    browserTransitionPromise = null;
+  });
+  return browserTransitionPromise;
+}
+
+async function recoverBrowser(failedBrowser) {
+  if (
+    browser &&
+    browser !== failedBrowser &&
+    browser.isConnected()
+  ) {
+    return browser;
+  }
+  if (browserTransitionPromise) {
+    return browserTransitionPromise;
+  }
+  browserTransitionPromise = (async () => {
+    console.log('[BROWSER RECOVERY] Relaunching Chrome');
+    if (browser === failedBrowser) browser = null;
+    await closeBrowserInstance(failedBrowser);
+    if (shuttingDown) {
+      throw new Error('Service is shutting down');
+    }
+    await launchBrowser();
+    return browser;
+  })().finally(() => {
+    browserTransitionPromise = null;
+  });
+  return browserTransitionPromise;
+}
+
+async function recycleTimedOutBrowser(affectedBrowser, cleanupDeadline) {
+  if (browserTransitionPromise) {
+    await settleWithin(
+      browserTransitionPromise,
+      Math.min(remainingUntil(cleanupDeadline), 250)
+    );
+  }
+  if (affectedBrowser && !affectedBrowser.isConnected()) {
+    const launchResult = await settleWithin(
+      getOrLaunchBrowser(),
+      remainingUntil(cleanupDeadline)
+    );
+    return { processStopped: true, browserReady: launchResult.settled && !launchResult.error };
+  }
+  const chromeProcess = typeof affectedBrowser?.process === 'function'
+    ? affectedBrowser.process()
+    : null;
+  let processStopped = false;
+  let killSent = false;
+
+  browserTransitionPromise = (async () => {
+    console.log('[PDF TIMEOUT] Invalidating affected browser');
+    const closeBudget = Math.min(
+      remainingUntil(cleanupDeadline),
+      Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+    );
+    const closeResult = await settleWithin(
+      Promise.resolve().then(() => affectedBrowser?.close()),
+      closeBudget
+    );
+    if (closeResult.settled && !closeResult.error) {
+      processStopped = true;
+    } else if (chromeProcess && typeof chromeProcess.kill === 'function') {
+      console.error('[PDF TIMEOUT] browser.close() timed out; sending SIGKILL');
+      try {
+        killSent = chromeProcess.kill('SIGKILL') !== false;
+        processStopped = killSent;
+      } catch (killError) {
+        console.error(`[PDF TIMEOUT] SIGKILL failed: ${killError.message}`);
+      }
+    }
+    if (shuttingDown) return browser;
+    if (browser === affectedBrowser) browser = null;
+    if (browser && browser.isConnected()) return browser;
+    return launchBrowser();
+  })().finally(() => {
+    browserTransitionPromise = null;
+  });
+  const transitionResult = await settleWithin(
+    browserTransitionPromise,
+    remainingUntil(cleanupDeadline)
+  );
+  browserTransitionPromise.catch(() => {});
+  return {
+    processStopped,
+    killSent,
+    browserReady: transitionResult.settled && !transitionResult.error
+  };
+}
+
+async function getBrowser() {
+  if (shuttingDown) {
+    throw new Error('Service is shutting down');
+  }
+  if (browserUptimeLimitReached()) {
+    scheduleBrowserRecycle();
+  }
+  if (recyclePending) {
+    await recycleBrowser();
+  }
+  return getOrLaunchBrowser();
 }
 
 function sleep(ms) {
@@ -197,13 +426,67 @@ function validateTargetUrl(value) {
   return parsed.toString();
 }
 
-async function generatePdf(url, requestId) {
+class PdfRequestTimeoutError extends Error {
+  constructor() {
+    super(`PDF request exceeded ${PDF_REQUEST_TIMEOUT_MS} ms`);
+    this.name = 'TimeoutError';
+  }
+}
+
+function isRecoverableBrowserError(error) {
+  if (!error || error.name === 'TimeoutError') return false;
+  const text = `${error.name || ''} ${error.message || ''}`;
+  return /TargetClosedError|ProtocolError|Browser disconnected|Session closed|Connection closed/i.test(text);
+}
+
+function closeContextPage(context, requestId, url) {
+  if (!context.page) return Promise.resolve(true);
+  if (context.closePromise) return context.closePromise;
+
+  const page = context.page;
+  context.closePromise = (async () => {
+    if (!page.isClosed()) {
+      await page.close();
+    }
+    return true;
+  })().catch(closeError => {
+    console.error(
+      `[PAGE CLOSE ERROR] requestId=${requestId} ` +
+      `url=${url} message=${closeError.message}`
+    );
+    return false;
+  });
+
+  return context.closePromise;
+}
+
+function releaseContextPage(context, page) {
+  if (!context.pageActive || context.page !== page) return;
+  context.pageActive = false;
+  activePages -= 1;
+  notifyActivityChange();
+}
+
+async function generatePdfAttempt(url, requestId, context) {
   let page = null;
+  let attemptBrowser = null;
 
   try {
-    const activeBrowser = await getBrowser();
+    if (Date.now() >= context.deadline) {
+      throw new PdfRequestTimeoutError();
+    }
+    attemptBrowser = await getBrowser();
+    context.attemptBrowser = attemptBrowser;
 
-    page = await activeBrowser.newPage();
+    page = await attemptBrowser.newPage();
+    context.page = page;
+    context.closePromise = null;
+    context.pageActive = true;
+    activePages += 1;
+    notifyActivityChange();
+    if (context.timedOut || Date.now() >= context.deadline) {
+      throw new PdfRequestTimeoutError();
+    }
 
     page.setDefaultNavigationTimeout(
       NAVIGATION_TIMEOUT_MS
@@ -250,20 +533,141 @@ async function generatePdf(url, requestId) {
       `[PDF OK] requestId=${requestId} url=${url}`
     );
 
-    return Buffer.from(pdfBuffer);
+    return { pdfBuffer: Buffer.from(pdfBuffer), attemptBrowser };
+  } catch (error) {
+    error.attemptBrowser = attemptBrowser;
+    throw error;
   } finally {
-    if (page && !page.isClosed()) {
+    if (page) {
+      await closeContextPage(context, requestId, url);
+      releaseContextPage(context, page);
+      if (context.page === page) {
+        context.page = null;
+        context.closePromise = null;
+      }
+      if (recyclePending) void recycleBrowser().catch(err => {
+        console.error(`[BROWSER RECYCLE] Failed: ${err.message}`);
+      });
+    }
+  }
+}
+
+async function generatePdfWithRetry(url, requestId, context) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const result = await generatePdfAttempt(url, requestId, context);
+      if (browser === result.attemptBrowser) {
+        browserProcessedRequests += 1;
+      }
+      if (
+        browser === result.attemptBrowser &&
+        BROWSER_MAX_REQUESTS > 0 &&
+        browserProcessedRequests >= BROWSER_MAX_REQUESTS
+      ) {
+        scheduleBrowserRecycle();
+        void recycleBrowser().catch(err => {
+          console.error(`[BROWSER RECYCLE] Failed: ${err.message}`);
+        });
+      }
+      return result.pdfBuffer;
+    } catch (error) {
+      if (context.timedOut || Date.now() >= context.deadline) {
+        throw new PdfRequestTimeoutError();
+      }
+      if (attempt > 0 || !isRecoverableBrowserError(error)) {
+        throw error;
+      }
+      console.error('[BROWSER RECOVERY] Recoverable error detected');
+      await recoverBrowser(error.attemptBrowser);
+      if (Date.now() >= context.deadline) {
+        throw new PdfRequestTimeoutError();
+      }
+      console.log('[BROWSER RECOVERY] Chrome ready; retrying request');
+    }
+  }
+  throw new Error('PDF generation failed after browser recovery');
+}
+
+async function generatePdf(url, requestId) {
+  const context = {
+    deadline: Date.now() + PDF_REQUEST_TIMEOUT_MS,
+    page: null,
+    closePromise: null,
+    attemptBrowser: null,
+    pageActive: false,
+    timedOut: false
+  };
+  let timeoutId;
+  const operationPromise = generatePdfWithRetry(url, requestId, context);
+  const timeoutPromise = new Promise(resolve => {
+    timeoutId = setTimeout(() => {
+      context.timedOut = true;
+      resolve({ timedOut: true });
+    }, PDF_REQUEST_TIMEOUT_MS);
+  });
+
+  try {
+    const result = await Promise.race([
+      operationPromise.then(value => ({ value })),
+      timeoutPromise
+    ]);
+    if (!result.timedOut) return result.value;
+
+    console.error(`[PDF TIMEOUT] requestId=${requestId} url=${url}`);
+    const cleanupDeadline = Date.now() + PDF_TIMEOUT_CLEANUP_MS;
+    const pageCloseResult = await settleWithin(
+      closeContextPage(context, requestId, url),
+      Math.min(
+        remainingUntil(cleanupDeadline),
+        Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+      )
+    );
+    let operationResult = await settleWithin(
+      operationPromise,
+      Math.min(
+        remainingUntil(cleanupDeadline),
+        pageCloseResult.settled && pageCloseResult.value === true
+          ? Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+          : 0
+      )
+    );
+
+    if (!operationResult.settled) {
+      console.error(
+        `[PDF TIMEOUT] Cleanup incomplete; recycling affected browser ` +
+        `requestId=${requestId}`
+      );
       try {
-        await page.close();
-      } catch (closeError) {
+        const recycleResult = await recycleTimedOutBrowser(
+          context.attemptBrowser,
+          cleanupDeadline
+        );
+        if (!recycleResult.processStopped) {
+          console.error(
+            `[PDF TIMEOUT] Affected Chrome process could not be confirmed stopped ` +
+            `requestId=${requestId}`
+          );
+        }
+      } catch (recoveryError) {
         console.error(
-          `[PAGE CLOSE ERROR] ` +
-          `requestId=${requestId} ` +
-          `url=${url} ` +
-          `message=${closeError.message}`
+          `[PDF TIMEOUT] Browser recycle failed requestId=${requestId} ` +
+          `message=${recoveryError.message}`
         );
       }
+      operationResult = await settleWithin(
+        operationPromise,
+        remainingUntil(cleanupDeadline)
+      );
+      if (!operationResult.settled) {
+        operationPromise.catch(() => {});
+        releaseContextPage(context, context.page);
+      }
     }
+
+    throw new PdfRequestTimeoutError();
+  } finally {
+    clearTimeout(timeoutId);
+    operationPromise.catch(() => {});
   }
 }
 
@@ -276,15 +680,22 @@ async function shutdown(signal) {
 
   console.log(`[SHUTDOWN] Received ${signal}`);
 
-  if (server) {
-    server.close();
-
-    if (
-      typeof server.closeIdleConnections === 'function'
-    ) {
-      server.closeIdleConnections();
+  const queuedResponseFlushes = [];
+  for (const queued of queuedPdfRequests) {
+    if (!queued.res.headersSent && !queued.res.writableEnded) {
+      queuedResponseFlushes.push(new Promise(resolve => {
+        queued.res.once('finish', resolve);
+        queued.res.once('close', resolve);
+      }));
+      queued.res.status(503).send('Service is shutting down');
     }
   }
+  queuedPdfRequests.clear();
+  await Promise.all(queuedResponseFlushes);
+
+  const serverClosePromise = server
+    ? new Promise(resolve => server.close(resolve))
+    : Promise.resolve();
 
   const forceExitTimer = setTimeout(() => {
     console.error(
@@ -297,15 +708,31 @@ async function shutdown(signal) {
   forceExitTimer.unref();
 
   try {
-    if (browser && browser.isConnected()) {
-      await browser.close();
+    console.log(
+      `[SHUTDOWN] Waiting for ${activePdfOperations} active PDF request(s)`
+    );
+    await waitForCondition(() => activePdfOperations === 0);
+    if (server && typeof server.closeIdleConnections === 'function') {
+      server.closeIdleConnections();
     }
+    await serverClosePromise;
+    if (browserTransitionPromise) {
+      try {
+        await browserTransitionPromise;
+      } catch (err) {
+        console.error(`[SHUTDOWN] Browser transition error: ${err.message}`);
+      }
+    }
+    await closeBrowserInstance(browser);
+    console.log('[SHUTDOWN] Browser closed');
   } catch (err) {
     console.error(
       `[SHUTDOWN] Browser close error: ${err.message}`
     );
   }
 
+  clearTimeout(forceExitTimer);
+  console.log('[SHUTDOWN] Complete');
   logStream.end(() => process.exit(0));
 }
 
@@ -352,6 +779,13 @@ async function main() {
       return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
 
+    next();
+  });
+
+  app.use((req, res, next) => {
+    if (shuttingDown) {
+      return res.status(503).send('Service is shutting down');
+    }
     next();
   });
 
@@ -432,15 +866,27 @@ async function main() {
         );
     }
 
+    const queuedRequest = { req, res };
+    queuedPdfRequests.add(queuedRequest);
+
     limit(async () => {
+      queuedPdfRequests.delete(queuedRequest);
       if (
         res.writableEnded ||
-        req.destroyed ||
-        shuttingDown
+        req.destroyed
       ) {
         return;
       }
 
+      if (shuttingDown) {
+        if (!res.headersSent && !res.writableEnded) {
+          res.status(503).send('Service is shutting down');
+        }
+        return;
+      }
+
+      activePdfOperations += 1;
+      notifyActivityChange();
       try {
         const pdfBuffer = await generatePdf(
           url,
@@ -477,8 +923,12 @@ async function main() {
             .status(status)
             .send('Error generating PDF');
         }
+      } finally {
+        activePdfOperations -= 1;
+        notifyActivityChange();
       }
     }).catch(err => {
+      queuedPdfRequests.delete(queuedRequest);
       console.error(
         `[QUEUE ERROR] ` +
         `requestId=${req.requestId} ` +
@@ -533,6 +983,10 @@ async function main() {
               MAX_CONCURRENT_REQUESTS,
             maxPending:
               MAX_QUEUE_SIZE
+          },
+          operations: {
+            activePages,
+            activePdfOperations
           },
           memory: process.memoryUsage(),
           uptimeSeconds:

@@ -128,6 +128,14 @@ API_KEYS_FILE=/home/pdf/server/apikeys.json
 MASTER_KEY_FILE=/home/pdf/server/master-key.json
 API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
 LOG_DIR=/home/pdf/server/logs
+PDF_REQUEST_TIMEOUT_MS=60000
+PDF_TIMEOUT_CLEANUP_MS=3000
+BROWSER_MAX_REQUESTS=5000
+BROWSER_MAX_UPTIME_SECONDS=21600
+WATCHDOG_URL=http://127.0.0.1:8214/health
+WATCHDOG_TIMEOUT_SECONDS=10
+WATCHDOG_FAILURE_THRESHOLD=2
+WATCHDOG_RESTART_COOLDOWN_SECONDS=60
 EOF
 fi
 
@@ -172,6 +180,7 @@ systemctl restart html2pdf.service
 
 for _ in {1..30}; do
   if curl --silent --fail http://127.0.0.1:8214/health >/dev/null; then
+    bash "${SCRIPT_DIR}/scripts/install-watchdog.sh"
     log "Installation complete; service is healthy."
     if [[ -n "${GENERATED_MASTER_KEY}" ]]; then
       printf '\nMaster key (save it now; it will not be shown again): %s\n' "${GENERATED_MASTER_KEY}"
