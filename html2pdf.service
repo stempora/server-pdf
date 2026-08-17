@@ -5,24 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pdf
-WorkingDirectory=/home/pdf/server
-ExecStart=/usr/bin/node /home/pdf/server/server.js
+User=@SERVICE_USER@
+Group=@SERVICE_USER@
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=/usr/bin/node @INSTALL_DIR@/server.js
+EnvironmentFile=@CONFIG_DIR@/environment
 
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
 KillMode=mixed
-
-Environment=PORT=8214
-Environment=CHROME_PATH=/usr/bin/google-chrome-stable
-Environment=MAX_CONCURRENT_REQUESTS=20
-Environment=MAX_QUEUE_SIZE=200
-Environment=NAVIGATION_TIMEOUT_MS=30000
-Environment=PAGE_TIMEOUT_MS=15000
-Environment=FONT_TIMEOUT_MS=5000
-Environment=RENDER_DELAY_MS=250
-Environment=SHUTDOWN_TIMEOUT_MS=15000
 
 # Server has 64 GB RAM; preserve capacity for the OS and other services.
 MemoryHigh=48G
