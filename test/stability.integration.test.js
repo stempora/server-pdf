@@ -155,6 +155,51 @@ test('failed page close recycles the affected browser and still returns 504', as
   assert.deepEqual(health.operations, { activePages: 0, activePdfOperations: 0 });
 });
 
+for (const scenario of [
+  {
+    name: 'blocked page.close()',
+    target: 'https://example.com/?mockDelay=5000&mockPageCloseHangs=1',
+    expectsSigkill: false
+  },
+  {
+    name: 'blocked browser.close()',
+    target: 'https://example.com/?mockOperationNever=1&mockCloseFails=1&mockBrowserCloseHangs=1',
+    expectsSigkill: true
+  },
+  {
+    name: 'operation Promise pending after page.close()',
+    target: 'https://example.com/?mockOperationNever=1',
+    expectsSigkill: false
+  }
+]) {
+  test(`strict cleanup deadline handles ${scenario.name}`, async t => {
+    const server = await startServer(t, {
+      PDF_REQUEST_TIMEOUT_MS: '1000',
+      PDF_TIMEOUT_CLEANUP_MS: '600',
+      MAX_CONCURRENT_REQUESTS: '1'
+    });
+    const startedAt = Date.now();
+    const response = await server.pdf(scenario.target);
+    const elapsed = Date.now() - startedAt;
+    assert.equal(response.status, 504);
+    assert.ok(elapsed < 2500, `504 exceeded the strict request + cleanup bound: ${elapsed} ms`);
+
+    const stateAfterTimeout = server.state();
+    assert.equal(
+      stateAfterTimeout.events.some(event => event.type === 'process-kill' && event.signal === 'SIGKILL'),
+      scenario.expectsSigkill
+    );
+    assert.equal(stateAfterTimeout.launches, 2);
+    assert.equal(stateAfterTimeout.maxActivePdfCalls, 1);
+    assert.doesNotMatch(server.output(), /UnhandledPromiseRejection|unhandledRejection/i);
+
+    assert.equal((await server.pdf('https://example.org/')).status, 200);
+    assert.equal(server.state().maxActivePdfCalls, 1);
+    const health = await (await fetch(`${server.base}/health`)).json();
+    assert.deepEqual(health.operations, { activePages: 0, activePdfOperations: 0 });
+  });
+}
+
 test('recoverable browser failures share one relaunch and get one retry', async t => {
   const server = await startServer(t, { PDF_REQUEST_TIMEOUT_MS: '5000' });
   const responses = await Promise.all([

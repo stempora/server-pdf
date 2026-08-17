@@ -49,7 +49,9 @@ const BROWSER_MAX_REQUESTS = parseBoundedInteger(
 const BROWSER_MAX_UPTIME_SECONDS = parseBoundedInteger(
   'BROWSER_MAX_UPTIME_SECONDS', 21600, 0, 604800
 );
-const PDF_TIMEOUT_CLEANUP_MS = 3000;
+const PDF_TIMEOUT_CLEANUP_MS = parseBoundedInteger(
+  'PDF_TIMEOUT_CLEANUP_MS', 3000, 100, 30000
+);
 
 const API_KEYS_FILE =
   process.env.API_KEYS_FILE || path.join(__dirname, 'apikeys.json');
@@ -216,6 +218,30 @@ function waitForCondition(predicate) {
   });
 }
 
+function settleWithin(promise, timeoutMs) {
+  if (timeoutMs <= 0) {
+    promise.catch(() => {});
+    return Promise.resolve({ settled: false });
+  }
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve({ settled: false }), timeoutMs);
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve({ settled: true, value });
+      },
+      error => {
+        clearTimeout(timer);
+        resolve({ settled: true, error });
+      }
+    );
+  });
+}
+
+function remainingUntil(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+
 async function closeBrowserInstance(instance) {
   if (!instance) return;
   try {
@@ -308,26 +334,64 @@ async function recoverBrowser(failedBrowser) {
   return browserTransitionPromise;
 }
 
-async function recycleTimedOutBrowser(affectedBrowser) {
+async function recycleTimedOutBrowser(affectedBrowser, cleanupDeadline) {
   if (browserTransitionPromise) {
-    await browserTransitionPromise;
+    await settleWithin(
+      browserTransitionPromise,
+      Math.min(remainingUntil(cleanupDeadline), 250)
+    );
   }
   if (affectedBrowser && !affectedBrowser.isConnected()) {
-    return getOrLaunchBrowser();
+    const launchResult = await settleWithin(
+      getOrLaunchBrowser(),
+      remainingUntil(cleanupDeadline)
+    );
+    return { processStopped: true, browserReady: launchResult.settled && !launchResult.error };
   }
-  if (browserTransitionPromise) {
-    return browserTransitionPromise;
-  }
+  const chromeProcess = typeof affectedBrowser?.process === 'function'
+    ? affectedBrowser.process()
+    : null;
+  let processStopped = false;
+  let killSent = false;
+
   browserTransitionPromise = (async () => {
     console.log('[PDF TIMEOUT] Invalidating affected browser');
-    await closeBrowserInstance(affectedBrowser);
+    const closeBudget = Math.min(
+      remainingUntil(cleanupDeadline),
+      Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+    );
+    const closeResult = await settleWithin(
+      Promise.resolve().then(() => affectedBrowser?.close()),
+      closeBudget
+    );
+    if (closeResult.settled && !closeResult.error) {
+      processStopped = true;
+    } else if (chromeProcess && typeof chromeProcess.kill === 'function') {
+      console.error('[PDF TIMEOUT] browser.close() timed out; sending SIGKILL');
+      try {
+        killSent = chromeProcess.kill('SIGKILL') !== false;
+        processStopped = killSent;
+      } catch (killError) {
+        console.error(`[PDF TIMEOUT] SIGKILL failed: ${killError.message}`);
+      }
+    }
     if (shuttingDown) return browser;
+    if (browser === affectedBrowser) browser = null;
     if (browser && browser.isConnected()) return browser;
     return launchBrowser();
   })().finally(() => {
     browserTransitionPromise = null;
   });
-  return browserTransitionPromise;
+  const transitionResult = await settleWithin(
+    browserTransitionPromise,
+    remainingUntil(cleanupDeadline)
+  );
+  browserTransitionPromise.catch(() => {});
+  return {
+    processStopped,
+    killSent,
+    browserReady: transitionResult.settled && !transitionResult.error
+  };
 }
 
 async function getBrowser() {
@@ -396,6 +460,13 @@ function closeContextPage(context, requestId, url) {
   return context.closePromise;
 }
 
+function releaseContextPage(context, page) {
+  if (!context.pageActive || context.page !== page) return;
+  context.pageActive = false;
+  activePages -= 1;
+  notifyActivityChange();
+}
+
 async function generatePdfAttempt(url, requestId, context) {
   let page = null;
   let attemptBrowser = null;
@@ -410,6 +481,7 @@ async function generatePdfAttempt(url, requestId, context) {
     page = await attemptBrowser.newPage();
     context.page = page;
     context.closePromise = null;
+    context.pageActive = true;
     activePages += 1;
     notifyActivityChange();
     if (context.timedOut || Date.now() >= context.deadline) {
@@ -468,12 +540,11 @@ async function generatePdfAttempt(url, requestId, context) {
   } finally {
     if (page) {
       await closeContextPage(context, requestId, url);
+      releaseContextPage(context, page);
       if (context.page === page) {
         context.page = null;
         context.closePromise = null;
       }
-      activePages -= 1;
-      notifyActivityChange();
       if (recyclePending) void recycleBrowser().catch(err => {
         console.error(`[BROWSER RECYCLE] Failed: ${err.message}`);
       });
@@ -523,6 +594,7 @@ async function generatePdf(url, requestId) {
     page: null,
     closePromise: null,
     attemptBrowser: null,
+    pageActive: false,
     timedOut: false
   };
   let timeoutId;
@@ -542,36 +614,60 @@ async function generatePdf(url, requestId) {
     if (!result.timedOut) return result.value;
 
     console.error(`[PDF TIMEOUT] requestId=${requestId} url=${url}`);
-    const pageClosed = await closeContextPage(context, requestId, url);
-    let operationSettled = false;
-    await Promise.race([
-      operationPromise.then(
-        () => { operationSettled = true; },
-        () => { operationSettled = true; }
-      ),
-      sleep(pageClosed ? PDF_TIMEOUT_CLEANUP_MS : 0)
-    ]);
+    const cleanupDeadline = Date.now() + PDF_TIMEOUT_CLEANUP_MS;
+    const pageCloseResult = await settleWithin(
+      closeContextPage(context, requestId, url),
+      Math.min(
+        remainingUntil(cleanupDeadline),
+        Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+      )
+    );
+    let operationResult = await settleWithin(
+      operationPromise,
+      Math.min(
+        remainingUntil(cleanupDeadline),
+        pageCloseResult.settled && pageCloseResult.value === true
+          ? Math.max(50, Math.floor(PDF_TIMEOUT_CLEANUP_MS / 3))
+          : 0
+      )
+    );
 
-    if (!operationSettled) {
+    if (!operationResult.settled) {
       console.error(
         `[PDF TIMEOUT] Cleanup incomplete; recycling affected browser ` +
         `requestId=${requestId}`
       );
       try {
-        await recycleTimedOutBrowser(context.attemptBrowser);
+        const recycleResult = await recycleTimedOutBrowser(
+          context.attemptBrowser,
+          cleanupDeadline
+        );
+        if (!recycleResult.processStopped) {
+          console.error(
+            `[PDF TIMEOUT] Affected Chrome process could not be confirmed stopped ` +
+            `requestId=${requestId}`
+          );
+        }
       } catch (recoveryError) {
         console.error(
           `[PDF TIMEOUT] Browser recycle failed requestId=${requestId} ` +
           `message=${recoveryError.message}`
         );
       }
-      await operationPromise.catch(() => {});
+      operationResult = await settleWithin(
+        operationPromise,
+        remainingUntil(cleanupDeadline)
+      );
+      if (!operationResult.settled) {
+        operationPromise.catch(() => {});
+        releaseContextPage(context, context.page);
+      }
     }
 
     throw new PdfRequestTimeoutError();
   } finally {
     clearTimeout(timeoutId);
-    await operationPromise.catch(() => {});
+    operationPromise.catch(() => {});
   }
 }
 

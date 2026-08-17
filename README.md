@@ -46,6 +46,7 @@ MASTER_KEY_FILE=/home/pdf/server/master-key.json
 API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
 LOG_DIR=/home/pdf/server/logs
 PDF_REQUEST_TIMEOUT_MS=60000
+PDF_TIMEOUT_CLEANUP_MS=3000
 BROWSER_MAX_REQUESTS=5000
 BROWSER_MAX_UPTIME_SECONDS=21600
 WATCHDOG_URL=http://127.0.0.1:8214/health
@@ -54,7 +55,7 @@ WATCHDOG_FAILURE_THRESHOLD=2
 WATCHDOG_RESTART_COOLDOWN_SECONDS=60
 ```
 
-`PDF_REQUEST_TIMEOUT_MS` limitează întregul ciclu al unei cereri, inclusiv singura reîncercare permisă după o eroare recuperabilă Chrome. La timeout pagina este închisă și clientul primește `504`. Erorile obișnuite ale paginii, URL-urile invalide, timeout-urile și anulările nu sunt reîncercate.
+`PDF_REQUEST_TIMEOUT_MS` limitează întregul ciclu al unei cereri, inclusiv singura reîncercare permisă după o eroare recuperabilă Chrome. Cleanup-ul are un buget separat și strict, `PDF_TIMEOUT_CLEANUP_MS`; implicit răspunsul este limitat la 60 s de procesare plus maximum 3 s de cleanup. La timeout pagina este închisă, iar dacă închiderea Chrome se blochează procesul afectat primește `SIGKILL` înainte ca slotul să fie eliberat și clientul să primească `504`. Erorile obișnuite ale paginii, URL-urile invalide, timeout-urile și anulările nu sunt reîncercate.
 
 Chrome este reciclat controlat după `BROWSER_MAX_REQUESTS` documente sau după `BROWSER_MAX_UPTIME_SECONDS`, fără a închide pagini active. Valoarea `0` dezactivează limita respectivă. La `SIGTERM`/`SIGINT`, cererile noi și cele încă în coadă primesc `503`, cererile active sunt lăsate să termine, apoi browserul este închis. `SHUTDOWN_TIMEOUT_MS` rămâne limita forțată de oprire.
 

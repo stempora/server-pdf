@@ -26,8 +26,9 @@ function record(type, details = {}) {
 
 function delay(ms, pageState) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    pageState.rejectDelay = () => {
+    const timer = ms === Infinity ? null : setTimeout(resolve, ms);
+    pageState.rejectDelay = reason => {
+      if (pageState.operationNever && reason !== 'sigkill') return;
       clearTimeout(timer);
       const error = new Error('Target closed while rendering');
       error.name = 'TargetClosedError';
@@ -46,16 +47,33 @@ Module._load = function load(request, parent, isMain) {
       let connected = true;
       let activePages = 0;
       const browserPageStates = new Set();
+      const mockProcess = {
+        kill: signal => {
+          record('process-kill', { signal, browserGeneration: thisGeneration });
+          connected = false;
+          for (const pageState of browserPageStates) {
+            if (pageState.finishPdf) pageState.finishPdf('sigkill');
+            if (pageState.rejectDelay) pageState.rejectDelay('sigkill');
+          }
+          return true;
+        }
+      };
       record('launch');
       return {
         on() {},
+        process: () => mockProcess,
         isConnected: () => connected,
         version: async () => `MockChrome/${thisGeneration}`,
         close: async () => {
+          if (Array.from(browserPageStates).some(pageState => pageState.browserCloseHangs)) {
+            record('browser-close-hang', { activePages, browserGeneration: thisGeneration });
+            return new Promise(() => {});
+          }
           connected = false;
           record('browser-close', { activePages, browserGeneration: thisGeneration });
           for (const pageState of browserPageStates) {
-            if (pageState.rejectDelay) pageState.rejectDelay();
+            if (pageState.finishPdf) pageState.finishPdf('browser-close');
+            if (pageState.rejectDelay) pageState.rejectDelay('browser-close');
           }
         },
         newPage: async () => {
@@ -68,15 +86,29 @@ Module._load = function load(request, parent, isMain) {
           return {
             setDefaultNavigationTimeout() {},
             setDefaultTimeout() {},
-            goto: async url => { targetUrl = url; },
+            goto: async url => {
+              targetUrl = url;
+              const parsed = new URL(url);
+              pageState.browserCloseHangs = parsed.searchParams.get('mockBrowserCloseHangs') === '1';
+              pageState.operationNever = parsed.searchParams.get('mockOperationNever') === '1';
+            },
             evaluate: async () => {},
             pdf: async () => {
               activePdfCalls += 1;
               maxActivePdfCalls = Math.max(maxActivePdfCalls, activePdfCalls);
+              pageState.pdfActive = true;
+              pageState.finishPdf = reason => {
+                if (!pageState.pdfActive) return;
+                pageState.pdfActive = false;
+                activePdfCalls -= 1;
+                record('pdf-process-stop', { targetUrl, reason, browserGeneration: thisGeneration });
+              };
               record('pdf-start', { targetUrl, browserGeneration: thisGeneration });
               try {
                 const parsed = new URL(targetUrl);
-                const delayMs = Number(parsed.searchParams.get('mockDelay') || 0);
+                const delayMs = pageState.operationNever
+                  ? Infinity
+                  : Number(parsed.searchParams.get('mockDelay') || 0);
                 if (delayMs > 0) await delay(delayMs, pageState);
                 if (parsed.searchParams.get('mockError') === 'recoverable' && thisGeneration === 1) {
                   const error = new Error('Browser disconnected');
@@ -88,7 +120,7 @@ Module._load = function load(request, parent, isMain) {
                 }
                 return Buffer.from('%PDF-1.4\nmock\n');
               } finally {
-                activePdfCalls -= 1;
+                pageState.finishPdf('promise-finally');
                 browserPageStates.delete(pageState);
                 record('pdf-end', { targetUrl, browserGeneration: thisGeneration });
               }
@@ -101,6 +133,9 @@ Module._load = function load(request, parent, isMain) {
               if (parsed?.searchParams.get('mockCloseFails') === '1') {
                 throw new Error('Mock page close failed');
               }
+              if (parsed?.searchParams.get('mockPageCloseHangs') === '1') {
+                return new Promise(() => {});
+              }
               closed = true;
               activePages -= 1;
               record('page-close', { browserGeneration: thisGeneration });
@@ -108,7 +143,7 @@ Module._load = function load(request, parent, isMain) {
                 parsed?.searchParams.get('mockContinueAfterClose') !== '1' &&
                 pageState.rejectDelay
               ) {
-                pageState.rejectDelay();
+                pageState.rejectDelay('page-close');
               }
             }
           };

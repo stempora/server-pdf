@@ -45,6 +45,7 @@ test('installer creates secrets only when absent and secures them', () => {
 test('installer adds stability defaults only to a newly created environment and enables watchdog after health', () => {
   for (const setting of [
     'PDF_REQUEST_TIMEOUT_MS=60000',
+    'PDF_TIMEOUT_CLEANUP_MS=3000',
     'BROWSER_MAX_REQUESTS=5000',
     'BROWSER_MAX_UPTIME_SECONDS=21600',
     'WATCHDOG_FAILURE_THRESHOLD=2',
