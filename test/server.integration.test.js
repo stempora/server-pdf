@@ -43,7 +43,8 @@ test('admin lifecycle is immediate and preserves legacy PDF authentication', asy
   }));
   fs.mkdirSync(path.join(directory, 'logs'));
 
-  const child = spawn(process.execPath, ['-r', path.join(root, 'test-support', 'mock-puppeteer.js'), path.join(root, 'server.js')], {
+  const serverArguments = ['-r', path.join(root, 'test-support', 'mock-puppeteer.js'), path.join(root, 'server.js')];
+  const serverOptions = {
     cwd: root,
     env: {
       ...process.env,
@@ -55,7 +56,8 @@ test('admin lifecycle is immediate and preserves legacy PDF authentication', asy
       RENDER_DELAY_MS: '0'
     },
     stdio: ['ignore', 'pipe', 'pipe']
-  });
+  };
+  let child = spawn(process.execPath, serverArguments, serverOptions);
   t.after(async () => {
     if (child.exitCode === null) {
       child.kill('SIGTERM');
@@ -118,12 +120,26 @@ test('admin lifecycle is immediate and preserves legacy PDF authentication', asy
   assert.equal(changed.enabled, true);
   assert.equal((await fetch(`${base}/pdf?url=https://example.com`, { headers: { 'X-API-Key': created.key } })).status, 200);
 
-  const deleted = await (await fetch(`${base}/admin/delete-key/${created.key}`, { method: 'DELETE', headers: adminHeaders })).json();
-  assert.equal(deleted.success, true);
+  const orphanedMetadata = fs.readFileSync(metadataFile, 'utf8');
+  fs.rmSync(metadataFile);
+  fs.mkdirSync(metadataFile);
+  const failedDelete = await fetch(`${base}/admin/delete-key/${created.key}`, { method: 'DELETE', headers: adminHeaders });
+  assert.equal(failedDelete.status, 500);
+  assert.deepEqual(await failedDelete.json(), { success: false, error: 'Internal server error' });
+  assert.equal((await fetch(`${base}/pdf?url=https://example.com`, { headers: { 'X-API-Key': created.key } })).status, 401);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'apikeys.json'), 'utf8')), [legacyKey]);
+
+  fs.rmSync(metadataFile, { recursive: true });
+  fs.writeFileSync(metadataFile, orphanedMetadata);
+  child.kill('SIGTERM');
+  await new Promise(resolve => child.once('exit', resolve));
+  child = spawn(process.execPath, serverArguments, serverOptions);
+  await waitUntilReady(child, port);
+
   assert.equal((await fetch(`${base}/pdf?url=https://example.com`, { headers: { 'X-API-Key': created.key } })).status, 401);
   listed = await (await fetch(`${base}/admin/list-keys`, { headers: adminHeaders })).json();
   assert.equal(listed.keys.some(item => item.key === created.key), false);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'apikeys.json'), 'utf8')), [legacyKey]);
+  assert.equal(JSON.parse(fs.readFileSync(metadataFile, 'utf8'))[created.key].enabled, true);
 });
 
 test('corrupt metadata prevents startup without overwriting key files', async t => {

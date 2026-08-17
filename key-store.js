@@ -154,8 +154,8 @@ class KeyStore {
 
     // Removing the key first guarantees it cannot remain authorized after a partial failure.
     writeJsonAtomic(this.apiKeysFile, nextKeys);
-    writeJsonAtomic(this.metadataFile, nextMetadata);
     this.keys = nextKeys;
+    writeJsonAtomic(this.metadataFile, nextMetadata);
     this.metadata = nextMetadata;
     return { success: true, key };
   }

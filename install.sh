@@ -14,30 +14,69 @@ cleanup() { [[ -z "${STAGING_DIR}" ]] || rm -rf -- "${STAGING_DIR}"; }
 trap cleanup EXIT
 
 [[ "${EUID}" -eq 0 ]] || die "Run this installer as root (sudo ./install.sh)."
-[[ -f /etc/debian_version ]] || die "Only Debian and Ubuntu are supported."
 [[ ! -e "${INSTALL_DIR}/server.js" ]] || die "An existing installation was found; use update.sh instead."
+[[ -r /etc/os-release ]] || die "Cannot detect the Linux distribution (/etc/os-release is missing)."
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg openssl
+# shellcheck disable=SC1091
+source /etc/os-release
+OS_ID="${ID:-}"
+OS_MAJOR="${VERSION_ID%%.*}"
+
+case "${OS_ID}" in
+  debian|ubuntu)
+    PACKAGE_FAMILY="deb"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg openssl
+    ;;
+  almalinux|rocky|rhel)
+    PACKAGE_FAMILY="rpm"
+    [[ "${OS_MAJOR}" = "8" || "${OS_MAJOR}" = "9" ]] || die "${OS_ID} ${VERSION_ID} is unsupported; use version 8 or 9."
+    dnf install -y ca-certificates curl gnupg2 openssl shadow-utils findutils
+    ;;
+  *)
+    die "Unsupported distribution: ${OS_ID:-unknown}. Supported: Debian, Ubuntu, AlmaLinux 8-9, Rocky Linux 8-9, RHEL 8-9."
+    ;;
+esac
 
 current_node_major=0
 if command -v node >/dev/null 2>&1; then
   current_node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
 fi
-if (( current_node_major < 18 )); then
-  curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/html2pdf-nodesource.sh
+if (( current_node_major > 22 )); then
+  die "Node.js ${current_node_major} is installed; automatic downgrade to Node.js 22 is not safe."
+fi
+if (( current_node_major < 22 )); then
+  if [[ "${PACKAGE_FAMILY}" = "deb" ]]; then
+    nodesource_url="https://deb.nodesource.com/setup_22.x"
+  else
+    nodesource_url="https://rpm.nodesource.com/setup_22.x"
+  fi
+  curl -fsSL "${nodesource_url}" -o /tmp/html2pdf-nodesource.sh
   bash /tmp/html2pdf-nodesource.sh
   rm -f /tmp/html2pdf-nodesource.sh
-  apt-get install -y --no-install-recommends nodejs
+  if [[ "${PACKAGE_FAMILY}" = "deb" ]]; then
+    apt-get install -y --no-install-recommends nodejs
+  else
+    dnf install -y nodejs
+  fi
 fi
+[[ "$(node --version | sed -E 's/^v([0-9]+).*/\1/')" = "22" ]] || die "Node.js 22 installation verification failed."
 
 if ! command -v google-chrome-stable >/dev/null 2>&1; then
-  [[ "$(dpkg --print-architecture)" = "amd64" ]] || die "Automatic Google Chrome installation requires amd64."
-  curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/html2pdf-chrome.deb
-  apt-get install -y /tmp/html2pdf-chrome.deb
-  rm -f /tmp/html2pdf-chrome.deb
+  if [[ "${PACKAGE_FAMILY}" = "deb" ]]; then
+    [[ "$(dpkg --print-architecture)" = "amd64" ]] || die "Automatic Google Chrome installation requires amd64."
+    curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/html2pdf-chrome.deb
+    apt-get install -y /tmp/html2pdf-chrome.deb
+    rm -f /tmp/html2pdf-chrome.deb
+  else
+    [[ "$(uname -m)" = "x86_64" ]] || die "Automatic Google Chrome RPM installation requires x86_64."
+    curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm -o /tmp/html2pdf-chrome.rpm
+    dnf install -y /tmp/html2pdf-chrome.rpm
+    rm -f /tmp/html2pdf-chrome.rpm
+  fi
 fi
+[[ "$(command -v google-chrome-stable)" = "/usr/bin/google-chrome-stable" ]] || die "Google Chrome path verification failed."
 
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --create-home --home-dir /home/pdf --shell /usr/sbin/nologin "${SERVICE_USER}"

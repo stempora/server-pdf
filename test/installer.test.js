@@ -18,6 +18,19 @@ test('installer uses only the production application path', () => {
   assert.match(installer, /existing installation was found; use update\.sh instead/i);
 });
 
+test('installer has separate DEB and RPM paths for supported distributions', () => {
+  assert.match(installer, /source \/etc\/os-release/);
+  assert.match(installer, /debian\|ubuntu/);
+  assert.match(installer, /almalinux\|rocky\|rhel/);
+  assert.match(installer, /apt-get install/);
+  assert.match(installer, /dnf install -y/);
+  assert.match(installer, /https:\/\/deb\.nodesource\.com\/setup_22\.x/);
+  assert.match(installer, /https:\/\/rpm\.nodesource\.com\/setup_22\.x/);
+  assert.match(installer, /google-chrome-stable_current_amd64\.deb/);
+  assert.match(installer, /google-chrome-stable_current_x86_64\.rpm/);
+  assert.match(installer, /Node\.js 22 installation verification failed/);
+});
+
 test('installer creates secrets only when absent and secures them', () => {
   for (const file of ['master-key.json', 'apikeys.json', 'api-key-metadata.json']) {
     assert.ok(installer.includes(`if [[ ! -e \"\${INSTALL_DIR}/${file}\" ]]`));

@@ -25,7 +25,7 @@ Unitatea systemd este `/etc/systemd/system/html2pdf.service`, iar portul implici
 
 ## Instalare nouă
 
-`install.sh` este destinat exclusiv serverelor noi. Instalează Node.js și Google Chrome când lipsesc, creează utilizatorul `pdf`, generează cheile inițiale și pornește serviciul:
+`install.sh` este destinat exclusiv serverelor noi. Sunt suportate Debian/Ubuntu și AlmaLinux/Rocky Linux/RHEL 8–9 pe `x86_64`. Installerul detectează distribuția din `/etc/os-release`, folosește `apt` sau `dnf`, instalează Node.js 22 și Google Chrome Stable, creează utilizatorul `pdf`, generează cheile inițiale și pornește serviciul:
 
 ```bash
 git clone https://github.com/stempora/server-pdf.git
