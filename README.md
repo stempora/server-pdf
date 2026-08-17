@@ -45,7 +45,18 @@ API_KEYS_FILE=/home/pdf/server/apikeys.json
 MASTER_KEY_FILE=/home/pdf/server/master-key.json
 API_KEY_METADATA_FILE=/home/pdf/server/api-key-metadata.json
 LOG_DIR=/home/pdf/server/logs
+PDF_REQUEST_TIMEOUT_MS=60000
+BROWSER_MAX_REQUESTS=5000
+BROWSER_MAX_UPTIME_SECONDS=21600
+WATCHDOG_URL=http://127.0.0.1:8214/health
+WATCHDOG_TIMEOUT_SECONDS=10
+WATCHDOG_FAILURE_THRESHOLD=2
+WATCHDOG_RESTART_COOLDOWN_SECONDS=60
 ```
+
+`PDF_REQUEST_TIMEOUT_MS` limitează întregul ciclu al unei cereri, inclusiv singura reîncercare permisă după o eroare recuperabilă Chrome. La timeout pagina este închisă și clientul primește `504`. Erorile obișnuite ale paginii, URL-urile invalide, timeout-urile și anulările nu sunt reîncercate.
+
+Chrome este reciclat controlat după `BROWSER_MAX_REQUESTS` documente sau după `BROWSER_MAX_UPTIME_SECONDS`, fără a închide pagini active. Valoarea `0` dezactivează limita respectivă. La `SIGTERM`/`SIGINT`, cererile noi și cele încă în coadă primesc `503`, cererile active sunt lăsate să termine, apoi browserul este închis. `SHUTDOWN_TIMEOUT_MS` rămâne limita forțată de oprire.
 
 ## Cheia master
 
@@ -169,6 +180,31 @@ sudo ./update.sh
 ```
 
 Fișierele `environment`, `master-key.json`, `apikeys.json`, `api-key-metadata.json` și `logs/` nu sunt înlocuite de updater.
+
+## Watchdog systemd
+
+Instalarea nouă activează watchdog-ul numai după ce serviciul principal a trecut health check-ul. Pentru o instalare existentă, după actualizarea validată a aplicației, unitățile se instalează separat:
+
+```bash
+cd /home/pdf/server
+sudo ./scripts/install-watchdog.sh
+```
+
+Acest script activează doar `html2pdf-watchdog.timer`; nu repornește și nu pornește `html2pdf.service`. Timerul verifică la 30 de secunde răspunsul HTTP `200` și JSON-ul `{"status":"ok","browser":"connected"}`. După două eșecuri consecutive repornește serviciul, apoi verifică din nou. Cooldown-ul implicit este 60 de secunde, iar starea și lock-ul sunt exclusiv în `/run/html2pdf-watchdog`.
+
+Diagnostic:
+
+```bash
+systemctl status html2pdf-watchdog.timer
+journalctl -u html2pdf-watchdog.service -n 100 --no-pager
+sudo systemctl start html2pdf-watchdog.service
+```
+
+Rollback-ul codului prin `update.sh` nu modifică unitățile instalate. Pentru a dezactiva watchdog-ul fără a afecta serviciul PDF:
+
+```bash
+sudo systemctl disable --now html2pdf-watchdog.timer
+```
 
 ## Postman
 
